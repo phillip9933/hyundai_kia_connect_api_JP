@@ -56,10 +56,14 @@ Key values for the int exist in the `const.py <https://github.com/Hyundai-Kia-Co
 
 Japan (region 10, Hyundai brand 2) supports authentication, token refresh,
 vehicle discovery, and cached status. Its initial implementation is based on
-the Japan Bluelink Android app 1.0.17 request contracts and public login page;
-it has not yet been verified against a live account. Device registration uses
-a synthetic push registration identifier, whose acceptance requires live
-verification. Vehicle commands and forced refresh are disabled. Automatic
+the Japan Bluelink Android app 1.0.17 request contracts and public login page.
+Authentication, token renewal, device registration, vehicle discovery, and
+cached telemetry were verified with one Japan Hyundai account and vehicle.
+The registered device was preserved across renewal, and cached status was
+retrieved successfully afterward. A synthetic push
+registration identifier was accepted in that test; other accounts and models
+have not been verified, nor has long-running reliability. Vehicle commands
+and forced refresh are disabled. Automatic
 refresh falls back to cached status, so data may remain stale while the car
 is asleep. Account consent or identity verification must be completed in the
 official app. Kia and Genesis Japan are not supported.
