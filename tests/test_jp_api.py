@@ -476,3 +476,37 @@ def test_bad_request_classifies_only_known_auth_failures(api, payload, error):
     with pytest.raises(error) as raised:
         api.refresh_access_token(Token(refresh_token="synthetic"))
     assert type(raised.value) is error
+
+
+def test_language_accepts_empty_204_without_decoding_json(api):
+    language_response = response(None, 204)
+    language_response.json.side_effect = requests.exceptions.JSONDecodeError(
+        "empty response", "", 0
+    )
+    api.session.request.side_effect = [
+        response(None),
+        language_response,
+        response({"redirectUrl": api.REDIRECT_URI + "?code=SYNTHETIC_CODE"}),
+        response(
+            {
+                "access_token": "SYNTHETIC_ACCESS",
+                "token_type": "Bearer",
+                "refresh_token": "SYNTHETIC_REFRESH",
+                "expires_in": 3600,
+            }
+        ),
+        response(envelope({"deviceId": "SYNTHETIC_DEVICE"})),
+    ]
+    assert api.login("synthetic", "synthetic").device_id == "SYNTHETIC_DEVICE"
+    language_response.json.assert_not_called()
+
+
+def test_requests_json_decode_error_has_response_classification(api):
+    bad_response = response(None)
+    bad_response.json.side_effect = requests.exceptions.JSONDecodeError(
+        "invalid", "UNIQUE_SYNTHETIC_SECRET", 0
+    )
+    api.session.request.return_value = bad_response
+    with pytest.raises(InvalidAPIResponseError) as raised:
+        api.get_vehicles(Token())
+    assert "UNIQUE_SYNTHETIC_SECRET" not in str(raised.value)

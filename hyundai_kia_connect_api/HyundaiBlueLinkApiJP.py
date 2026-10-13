@@ -114,10 +114,10 @@ class HyundaiBlueLinkApiJP(ApiImpl):
             result = response.json()
         except (requests.exceptions.Timeout, RequestTimeoutError):
             raise RequestTimeoutError("Japan API request timed out") from None
-        except requests.exceptions.RequestException:
-            raise APIError("Japan API connection failed") from None
         except ValueError:
             raise InvalidAPIResponseError("Japan API returned invalid JSON") from None
+        except requests.exceptions.RequestException:
+            raise APIError("Japan API connection failed") from None
         if not isinstance(result, dict):
             raise InvalidAPIResponseError("Japan API returned an invalid object")
         self._check_errors(result)
@@ -227,7 +227,9 @@ class HyundaiBlueLinkApiJP(ApiImpl):
             )
         else:
             raise AuthenticationError("Japan login exceeded its redirect limit")
-        self._request("POST", "/api/v1/user/language", json={"lang": "ja"})
+        self._request(
+            "POST", "/api/v1/user/language", json_response=False, json={"lang": "ja"}
+        )
         result = self._request(
             "POST",
             "/api/v1/user/signin",
