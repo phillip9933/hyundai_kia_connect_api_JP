@@ -31,6 +31,7 @@ from .const import (
     REGION_EUROPE,
     REGION_EUROPE_CCI,
     REGION_INDIA,
+    REGION_JAPAN,
     REGION_NZ,
     REGION_USA,
     REGIONS,
@@ -39,6 +40,7 @@ from .const import (
 )
 from .exceptions import APIError, AuthenticationError, AuthenticationOTPRequired
 from .HyundaiBlueLinkApiBR import HyundaiBlueLinkApiBR
+from .HyundaiBlueLinkApiJP import HyundaiBlueLinkApiJP
 from .HyundaiBlueLinkApiUSA import HyundaiBlueLinkApiUSA
 from .HyundaiCciApiEU import HyundaiCciApiEU
 from .KiaCciApiEU import KiaCciApiEU
@@ -172,6 +174,9 @@ class VehicleManager:
         # Otherwise runs a cached update.
         started_at_utc: dt.datetime = dt.datetime.now(dt.UTC)
         vehicle = self.get_vehicle(vehicle_id)
+        if not self.api.supports_force_refresh:
+            self.update_vehicle_with_cached_state(vehicle_id)
+            return
         if vehicle.last_updated_at is not None:
             _LOGGER.debug(
                 f"{DOMAIN} - Time differential in seconds: {(started_at_utc - vehicle.last_updated_at).total_seconds()}"
@@ -436,6 +441,10 @@ class VehicleManager:
     def get_implementation_by_region_brand(
         region: int, brand: int, language: str
     ) -> ApiImpl:
+        if REGIONS[region] == REGION_JAPAN:
+            if BRANDS[brand] != BRAND_HYUNDAI:
+                raise APIError("Japan is supported only for Hyundai")
+            return HyundaiBlueLinkApiJP(region, brand, language)
         if REGIONS[region] == REGION_CANADA:
             return KiaUvoApiCA(region, brand, language)
         elif REGIONS[region] == REGION_EUROPE:

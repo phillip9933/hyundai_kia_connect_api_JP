@@ -433,6 +433,9 @@ class ApiImpl:
     supports_window_control: bool = False
     supports_valet_mode: bool = False
     supports_svm: bool = False
+    # Existing adapters retain their behavior; read-only regions opt out.
+    supports_remote_commands: bool = True
+    supports_force_refresh: bool = True
 
     def __init__(self) -> None:
         """Initialize."""

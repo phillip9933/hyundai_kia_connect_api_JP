@@ -49,9 +49,27 @@ Python 3.12 or newer is required to use this package. Vehicle manager is the key
 
 Key values for the int exist in the `const.py <https://github.com/Hyundai-Kia-Connect/hyundai_kia_connect_api/blob/master/hyundai_kia_connect_api/const.py>`_ file as::
 
-    REGIONS = {1: REGION_EUROPE, 2: REGION_CANADA, 3: REGION_USA, 4: REGION_CHINA, 5: REGION_AUSTRALIA, 6: REGION_INDIA, 7: REGION_NZ, 8: REGION_BRAZIL}
+    REGIONS = {1: REGION_EUROPE, 2: REGION_CANADA, 3: REGION_USA, 4: REGION_CHINA, 5: REGION_AUSTRALIA, 6: REGION_INDIA, 7: REGION_NZ, 8: REGION_BRAZIL, 9: REGION_EUROPE_CCI, 10: REGION_JAPAN}
+
     BRANDS = {1: BRAND_KIA, 2: BRAND_HYUNDAI, 3: BRAND_GENESIS}
     GEO_LOCATION_PROVIDERS = {1: OPENSTREETMAP, 2: GOOGLE}
+
+Japan (region 10, Hyundai brand 2) supports authentication, token refresh,
+vehicle discovery, and cached status. Its initial implementation is based on
+the Japan Bluelink Android app 1.0.17 request contracts and public login page;
+it has not yet been verified against a live account. Device registration uses
+a synthetic push registration identifier, whose acceptance requires live
+verification. Vehicle commands and forced refresh are disabled. Automatic
+refresh falls back to cached status, so data may remain stale while the car
+is asleep. Account consent or identity verification must be completed in the
+official app. Kia and Genesis Japan are not supported.
+Legacy cabin temperature is unavailable until its profile-dependent scale is
+implemented; CCS2 numeric temperature uses the shared status parser.
+
+Consumers can inspect ``api.supports_remote_commands`` and
+``api.supports_force_refresh`` before exposing commands or refresh options.
+Existing regions retain their previous behavior. Japan calls fail before
+network access when a vehicle command or explicit forced refresh is requested.
 
 
 Once this is done you can now make the following calls against the vehicle manager::
