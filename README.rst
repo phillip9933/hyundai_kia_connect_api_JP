@@ -62,18 +62,45 @@ cached telemetry were verified with one Japan Hyundai account and vehicle.
 The registered device was preserved across renewal, and cached status was
 retrieved successfully afterward. A synthetic push
 registration identifier was accepted in that test; other accounts and models
-have not been verified, nor has long-running reliability. Vehicle commands
-and forced refresh are disabled. Automatic
-refresh falls back to cached status, so data may remain stale while the car
-is asleep. Account consent or identity verification must be completed in the
-official app. Kia and Genesis Japan are not supported.
-Legacy cabin temperature is unavailable until its profile-dependent scale is
-implemented; CCS2 numeric temperature uses the shared status parser.
+have not been verified, nor has long-running reliability. Account consent or
+identity verification must be completed in the official app. Kia and Genesis
+Japan are not supported.
 
-Consumers can inspect ``api.supports_remote_commands`` and
-``api.supports_force_refresh`` before exposing commands or refresh options.
-Existing regions retain their previous behavior. Japan calls fail before
-network access when a vehicle command or explicit forced refresh is requested.
+Additional Japan features are implemented from observed app contracts and
+tested offline: profile-dependent legacy climate setpoint, stored parking
+position, EV energy totals and daily history, door locking/unlocking, charging start/stop,
+a profile-supported subset of climate start/stop, charge target/current settings,
+profile-supported window/vent/curtain controls, charge-port doors, hazard lights/horn,
+V2L limits, valet mode, navigation destinations, scheduled charging/climate, fresh status
+requests, and manual surround-view capture on equipped vehicles. These additions
+have not yet been verified with a live account. Commands and fresh status require
+the account PIN and a TLS MQTT subscription; command completion is correlated
+with the returned request identifier. An HTTP acknowledgement alone is not
+reported as success. Fresh status additionally requires a newer timestamp.
+MQTT sessions are closed when the adapter is unloaded or authentication changes.
+
+Parking data is requested only when absent from stored status, with an hourly
+retry limit for unavailable data. Missing stored charge targets are fetched at
+most hourly, and a target-setting write invalidates that cache. EV energy history
+is fetched at most once per day per adapter session. Invalid optional data is ignored; authentication and
+rate-limit failures propagate. Climate setpoint LO/HI or unknown profile scales stay
+unavailable rather than becoming numeric readings.
+
+Surround-view capture requires explicit safety acknowledgement. Completed images
+are held only in memory; passive image reads never initiate a capture, and an
+adapter restart requires a new manual capture. Climate and window options require
+supported profile metadata; unsupported combinations are rejected before requests.
+Japan trip-summary methods remain unavailable because no matching app contract
+has been established. Upgrading from cached-only development versions requires
+reauthentication with the account PIN to obtain a new notification-registration
+UUID for MQTT; existing cached reads and token renewal remain available.
+
+Consumers can inspect ``api.supports_remote_commands``,
+``api.supported_commands``, and ``api.supports_force_refresh`` before exposing
+commands or refresh options. Existing regions retain their previous behavior.
+Japan rejects unsupported commands before network access. Consumers must check
+``api.requires_command_confirmation`` and require ``ORDER_STATUS.SUCCESS`` when
+it is true; an unknown or failed result must not be presented as success.
 
 
 Once this is done you can now make the following calls against the vehicle manager::
