@@ -1,0 +1,509 @@
+"""Offline Japan command envelopes and truthful completion semantics."""
+
+import copy
+import json
+from types import SimpleNamespace
+from unittest.mock import Mock
+
+import pytest
+
+from hyundai_kia_connect_api.ApiImpl import (
+    ClimateRequestOptions,
+    POICoord,
+    POIInfo,
+    ScheduleChargingClimateRequestOptions,
+    WindowRequestOptions,
+)
+from hyundai_kia_connect_api.const import (
+    CHARGE_PORT_ACTION,
+    ORDER_STATUS,
+    VALET_MODE_ACTION,
+    VEHICLE_LOCK_ACTION,
+    WINDOW_STATE,
+)
+from hyundai_kia_connect_api.exceptions import (
+    AuthenticationError,
+    InvalidAPIResponseError,
+    UnsupportedControlError,
+)
+from hyundai_kia_connect_api.japan_commands import JapanCommandsMixin
+from hyundai_kia_connect_api.japan_mqtt import JapanMqttSession
+
+
+class Adapter(JapanCommandsMixin):
+    def __init__(self):
+        self._request = Mock(
+            side_effect=[
+                {"controlToken": "synthetic-control", "expiresTime": 60},
+                {"msgId": "synthetic-action"},
+            ]
+        )
+        self.helper = Mock()
+        self.helper.status.return_value = ORDER_STATUS.PENDING
+        self._mqtt_for_vehicle = Mock(return_value=self.helper)
+        self._vehicle_profiles = {"synthetic-car": {"option": {"hvacTempType": 1}}}
+        self._charge_target_cache = {"synthetic-car": (0, {0: 100, 1: 100})}
+
+    def _headers(self, token):
+        return {"Authorization": "Bearer synthetic-access"}
+
+    def _legacy_temperature(self, vehicle, payload):
+        return 20.0 if payload["value"] == "0CH" else None
+
+
+def setup():
+    return (
+        Adapter(),
+        SimpleNamespace(
+            pin="synthetic-pin",
+            mqtt_registration_uuid="synthetic-uuid",
+            device_id="synthetic-device",
+            control_token=None,
+            control_token_expiry=0,
+        ),
+        SimpleNamespace(id="synthetic-car"),
+    )
+
+
+@pytest.mark.parametrize(
+    "method,args,endpoint,command",
+    [
+        ("lock_action", (VEHICLE_LOCK_ACTION.LOCK,), "door", "DOOR_LOCK"),
+        ("lock_action", (VEHICLE_LOCK_ACTION.UNLOCK,), "door", "DOOR_UNLOCK"),
+        ("start_charge", (), "charge", "CHARGE_START"),
+        ("stop_charge", (), "charge", "CHARGE_STOP"),
+        ("stop_climate", (), "temperature", "EV_ENGINE_STOP"),
+    ],
+)
+def test_exact_command_payload_and_pin_headers(method, args, endpoint, command):
+    api, token, vehicle = setup()
+    assert getattr(api, method)(token, vehicle, *args) == "synthetic-action"
+    grant, request = api._request.call_args_list
+    assert grant.args == ("PUT", "/api/v1/user/pin")
+    assert grant.kwargs["json"] == {
+        "deviceId": "synthetic-device",
+        "pin": "synthetic-pin",
+    }
+    assert request.args == (
+        "POST",
+        f"/api/v2/spa/vehicles/synthetic-car/ccs2/control/{endpoint}",
+    )
+    assert request.kwargs["json"] == {"command": command}
+    assert request.kwargs["headers"]["Authorization"] == "Bearer synthetic-control"
+    api.helper.prepare.assert_called_once()
+    api.helper.track.assert_called_once_with("synthetic-action")
+    assert (
+        api.check_action_status(token, vehicle, "synthetic-action")
+        == ORDER_STATUS.PENDING
+    )
+
+
+def test_missing_pin_never_connects_or_submits():
+    api, token, vehicle = setup()
+    token.pin = None
+    with pytest.raises(AuthenticationError):
+        api.start_charge(token, vehicle)
+    api._request.assert_not_called()
+    api._mqtt_for_vehicle.assert_not_called()
+
+
+@pytest.mark.parametrize("identity", [None, "", "   ", "invalid/identity"])
+def test_old_token_mqtt_identity_requires_relogin_before_pin_grant(identity):
+    api, token, vehicle = setup()
+    token.mqtt_registration_uuid = identity
+    with pytest.raises(AuthenticationError):
+        api.start_charge(token, vehicle)
+    api._request.assert_not_called()
+    api._mqtt_for_vehicle.assert_not_called()
+
+
+def test_whitespace_pin_never_grants_control_token():
+    api, token, vehicle = setup()
+    token.pin = " \t "
+    with pytest.raises(AuthenticationError):
+        api.start_charge(token, vehicle)
+    api._request.assert_not_called()
+    api._mqtt_for_vehicle.assert_not_called()
+
+
+def test_unknown_or_other_vehicle_request_never_reports_success():
+    api, token, vehicle = setup()
+    assert api.check_action_status(token, vehicle, "untracked") == ORDER_STATUS.UNKNOWN
+    api.start_charge(token, vehicle)
+    assert (
+        api.check_action_status(
+            token, SimpleNamespace(id="other-car"), "synthetic-action"
+        )
+        == ORDER_STATUS.UNKNOWN
+    )
+    assert (
+        api.check_action_status(token, vehicle, "synthetic-action", True, 500)
+        == ORDER_STATUS.PENDING
+    )
+    api.helper.status.assert_called_with("synthetic-action", timeout=120)
+
+
+def test_cloud_charge_target_success_does_not_require_control_pin_or_mqtt():
+    api, token, vehicle = setup()
+    token.pin = None
+    api._request.side_effect = [{"retCode": "S"}]
+    action_id = api.set_charge_limits(token, vehicle, ac=80, dc=90)
+    assert api._request.call_args.kwargs["json"] == {
+        "targetSOClist": [
+            {"plugType": 0, "targetSOClevel": 90},
+            {"plugType": 1, "targetSOClevel": 80},
+        ]
+    }
+    assert api.check_action_status(token, vehicle, action_id) == ORDER_STATUS.SUCCESS
+    api._mqtt_for_vehicle.assert_not_called()
+    assert vehicle.id not in api._charge_target_cache
+
+
+def test_charge_target_preserves_alternate_ac_plug_type():
+    api, token, vehicle = setup()
+    api._charge_target_cache[vehicle.id] = (0, {0: 100, 2: 100})
+    api._request.side_effect = [{"retCode": "S"}]
+    api.set_charge_limits(token, vehicle, ac=80, dc=90)
+    assert api._request.call_args.kwargs["json"]["targetSOClist"][1]["plugType"] == 2
+
+
+def test_climate_numeric_celsius_envelope_and_unsupported_options():
+    api, token, vehicle = setup()
+    options = ClimateRequestOptions(set_temp=20, defrost=False)
+    api.start_climate(token, vehicle, options)
+    assert api._request.call_args.kwargs["json"] == {
+        "command": "start",
+        "hvacTemp": "20.0",
+        "hvacTempType": 1,
+        "tempUnit": "C",
+        "windshieldFrontDefogState": False,
+    }
+    api._request.reset_mock()
+    options.duration = 10
+    with pytest.raises(UnsupportedControlError):
+        api.start_climate(token, vehicle, options)
+    api._request.assert_not_called()
+
+
+def test_incomplete_command_ack_never_creates_success_tracking():
+    api, token, vehicle = setup()
+    api._request.side_effect = [
+        {"controlToken": "synthetic-control", "expiresTime": 60},
+        {},
+    ]
+    with pytest.raises(InvalidAPIResponseError):
+        api.start_charge(token, vehicle)
+    api.helper.track.assert_not_called()
+    api.helper.close.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    "status", [ORDER_STATUS.SUCCESS, ORDER_STATUS.FAILED, ORDER_STATUS.TIMEOUT]
+)
+def test_terminal_status_survives_helper_cleanup(status):
+    api, token, vehicle = setup()
+    api.start_charge(token, vehicle)
+    api.helper.status.return_value = status
+    assert api.check_action_status(token, vehicle, "synthetic-action") == status
+    api.helper.close.assert_called_once()
+    api.helper.status.reset_mock()
+    assert api.check_action_status(token, vehicle, "synthetic-action") == status
+    api.helper.status.assert_not_called()
+
+
+def test_default_temperature_and_rhd_seat_capability_mapping():
+    api, token, vehicle = setup()
+    vehicle.air_temperature = 20.0
+    api._vehicle_profiles[vehicle.id]["option"].update(
+        {
+            "drvSeatLoc": "R",
+            "clmtCtrlOption": 1,
+            "seatHeaterVent": {"drvSeatHeat": 1, "astSeatHeat": 1},
+        }
+    )
+    options = ClimateRequestOptions(front_left_seat=6, front_right_seat=8, duration=5)
+    api.start_climate(token, vehicle, options)
+    payload = api._request.call_args.kwargs["json"]
+    assert payload["hvacTemp"] == "20.0"
+    assert payload["ignitionDuration"] == 5
+    assert payload["drvSeatLoc"] == "R"
+    assert payload["seatClimateInfo"] == {
+        "psgSeatClimateState": 6,
+        "drvSeatClimateState": 8,
+    }
+
+
+@pytest.mark.parametrize(
+    "method,args,capability,expected",
+    [
+        (
+            "charge_port_action",
+            (CHARGE_PORT_ACTION.OPEN,),
+            {"serviceOption": {"chargePortDoorOption": 1}},
+            "PORT_DOOR_OPEN",
+        ),
+        ("start_hazard_lights", (), {"option": {"lightOnlyAvailable": 1}}, "LIGHT"),
+        (
+            "start_hazard_lights_and_horn",
+            (),
+            {
+                "option": {"hornLightAvailable": 1},
+                "serviceOption": {"remoteLightControlOption": 0},
+            },
+            "HORN_LAMP",
+        ),
+    ],
+)
+def test_optional_controls_require_reported_profile_capability(
+    method, args, capability, expected
+):
+    api, token, vehicle = setup()
+    with pytest.raises(UnsupportedControlError):
+        getattr(api, method)(token, vehicle, *args)
+    api._request.assert_not_called()
+    api._vehicle_profiles[vehicle.id].update(capability)
+    getattr(api, method)(token, vehicle, *args)
+    assert api._request.call_args.kwargs["json"] == {"command": expected}
+
+
+@pytest.mark.parametrize(
+    "method,args,field,value",
+    [
+        ("set_charging_current", (2,), "chargingCurrent", 2),
+        ("set_vehicle_to_load_discharge_limit", (40,), "dischargingLimit", 40),
+    ],
+)
+def test_evidenced_charge_setting_commands(method, args, field, value):
+    api, token, vehicle = setup()
+    api._vehicle_profiles[vehicle.id]["serviceOption"] = {
+        "chargingCurrentSupport": 1,
+        "v2LSocSetServiceOption": 1,
+    }
+    getattr(api, method)(token, vehicle, *args)
+    assert api._request.call_args.kwargs["json"] == {field: value}
+    assert (
+        api.check_action_status(token, vehicle, "synthetic-action")
+        == ORDER_STATUS.PENDING
+    )
+
+
+def test_all_window_open_and_unproved_partial_rejection():
+    api, token, vehicle = setup()
+    api._vehicle_profiles[vehicle.id]["serviceOption"] = {"windowControlOption": 1}
+    options = WindowRequestOptions(
+        front_left=WINDOW_STATE.OPEN,
+        front_right=WINDOW_STATE.OPEN,
+        back_left=WINDOW_STATE.OPEN,
+        back_right=WINDOW_STATE.OPEN,
+    )
+    api.set_windows_state(token, vehicle, options)
+    assert api._request.call_args.kwargs["json"] == {"command": "WINDOW_OPEN"}
+    options.back_left = None
+    api._request.reset_mock()
+    with pytest.raises(UnsupportedControlError):
+        api.set_windows_state(token, vehicle, options)
+    api._request.assert_not_called()
+
+
+def test_schedule_cloud_snapshot_preserves_unspecified_fields_and_input():
+    api, token, vehicle = setup()
+    detail = {
+        "reservChargeSet": True,
+        "reservInfo": {"day": [1, 3], "time": {"time": "0830", "timeSection": 0}},
+        "reservFatcSet": {
+            "airCtrl": 1,
+            "airTemp": {"value": "0CH", "unit": 0, "hvacTempType": 1},
+            "heating1": 1,
+            "defrost": True,
+        },
+    }
+    current = {
+        "reservFlag": 1,
+        "reservChargeInfo": {"reservChargeInfoDetail": detail},
+        "reservChargeInfo2": {"reservChargeInfoDetail": copy.deepcopy(detail)},
+        "offPeakPowerInfo": {
+            "offPeakPowerFlag": 2,
+            "offPeakPowerTime1": {
+                "starttime": {"time": "1000", "timeSection": 1},
+                "endtime": {"time": "0700", "timeSection": 0},
+            },
+        },
+    }
+    before = copy.deepcopy(current)
+    api._payload = lambda result: result["resMsg"]
+    api._request.side_effect = [
+        {"controlToken": "synthetic-control", "expiresTime": 60},
+        {"resMsg": current},
+        {"msgId": "synthetic-action"},
+    ]
+    api.schedule_charging_and_climate(
+        token, vehicle, ScheduleChargingClimateRequestOptions(charging_enabled=False)
+    )
+    payload = api._request.call_args.kwargs["json"]
+    assert payload["reservFlag"] == 0
+    assert payload["offPeakPowerInfo"] == before["offPeakPowerInfo"]
+    assert payload["reservChargeInfo1"]["reservInfo"] == detail["reservInfo"]
+    assert payload["reservChargeInfo1"]["reservFatcSet"]["airTemp"]["value"] == "20.0"
+    assert current == before
+
+
+def test_valet_uses_non_ccs2_endpoint_and_explicit_capability():
+    api, token, vehicle = setup()
+    api._vehicle_profiles[vehicle.id]["serviceOption"] = {"remoteValetActOption": 1}
+    api.valet_mode_action(token, vehicle, VALET_MODE_ACTION.DEACTIVATE)
+    assert api._request.call_args.args[1].endswith("/control/valet")
+    assert "/ccs2/" not in api._request.call_args.args[1]
+    assert api._request.call_args.kwargs["json"] == {"action": "deactivate"}
+
+
+def test_boolean_capability_and_float_current_rejected_before_io():
+    api, token, vehicle = setup()
+    api._vehicle_profiles[vehicle.id]["serviceOption"] = {
+        "chargingCurrentSupport": True
+    }
+    with pytest.raises(UnsupportedControlError):
+        api.set_charging_current(token, vehicle, 1)
+    api._vehicle_profiles[vehicle.id]["serviceOption"]["chargingCurrentSupport"] = 1
+    with pytest.raises(ValueError):
+        api.set_charging_current(token, vehicle, 1.0)
+    api._request.assert_not_called()
+
+
+def test_navigation_exact_envelope_and_coordinate_validation():
+    api, token, vehicle = setup()
+    api.set_navigation(token, vehicle, [POIInfo(coord=POICoord(lat=35.0, lon=139.0))])
+    payload = api._request.call_args.kwargs["json"]
+    assert set(payload) == {"poiInfoList"}
+    assert payload["poiInfoList"][0]["waypointID"] == 0
+    assert api._request.call_args.args[1].endswith("/location/routes")
+    api._request.reset_mock()
+    with pytest.raises(ValueError):
+        api.set_navigation(
+            token, vehicle, [POIInfo(coord=POICoord(lat=float("nan"), lon=139.0))]
+        )
+    api._request.assert_not_called()
+
+
+@pytest.mark.parametrize("heating", [0, 1, 2, 3])
+def test_ha_combined_heating_modes_preserved(heating):
+    api, token, vehicle = setup()
+    api.start_climate(
+        token, vehicle, ClimateRequestOptions(set_temp=20, heating=heating)
+    )
+    assert api._request.call_args.kwargs["json"]["heating1"] == heating
+
+
+def test_separate_heating_profile_uses_exact_wire_fields():
+    api, token, vehicle = setup()
+    api._vehicle_profiles[vehicle.id]["option"]["strgWhlHeatOption"] = "2"
+    api.start_climate(
+        token,
+        vehicle,
+        ClimateRequestOptions(
+            set_temp=20, steering_wheel=2, side_rear_mirror_heating=1
+        ),
+    )
+    payload = api._request.call_args.kwargs["json"]
+    assert payload["heating1"] is None
+    assert payload["strgWhlHeating"] == 2
+    assert payload["sideRearMirrorHeating"] == 1
+
+
+def test_nullable_rhd_independent_window_and_vent_fields():
+    api, token, vehicle = setup()
+    api._vehicle_profiles[vehicle.id].update(
+        {
+            "option": {"drvSeatLoc": "R", "windowSafetyOption2": 3},
+            "serviceOption": {"windowControlOption": 1},
+        }
+    )
+    api.set_windows_state(
+        token, vehicle, WindowRequestOptions(front_right=WINDOW_STATE.VENTILATION)
+    )
+    payload = api._request.call_args.kwargs["json"]
+    assert payload["drvSeatWindow"] == 2
+    assert payload["psgSeatWindow"] is None
+    assert payload["rlSeatWindow"] is None
+    assert api._request.call_args.args[1].endswith("/control/windowcurtain")
+
+
+def test_aggregate_keeps_shared_real_mqtt_results_until_both_children_complete():
+    api, token, vehicle = setup()
+    token.access_token = "Bearer synthetic-access"
+    helper = JapanMqttSession(token, vehicle.id, "synthetic-uuid", dict)
+    helper._ready = True
+    helper._topics = ("synthetic-vss", "synthetic-res", "synthetic-connection")
+    helper.prepare = Mock()
+    api._mqtt_for_vehicle.return_value = helper
+    api._request.side_effect = [
+        {"controlToken": "synthetic-control", "expiresTime": 60},
+        {"msgId": "child-one"},
+        {"msgId": "child-two"},
+    ]
+    api._japan_command(token, vehicle, "reservation/charge", {})
+    api._japan_command(token, vehicle, "reservation/hvac", {})
+    api._remember_japan_action("aggregate", vehicle.id, ("child-one", "child-two"))
+    for child in ("child-one", "child-two"):
+        helper._on_message(
+            None,
+            None,
+            SimpleNamespace(
+                retain=False,
+                topic="synthetic-res",
+                payload=json.dumps({"sid": child, "res-msg": "S"}).encode(),
+            ),
+        )
+    assert api.check_action_status(token, vehicle, "aggregate") == ORDER_STATUS.SUCCESS
+    assert helper.closed
+    assert api.check_action_status(token, vehicle, "aggregate") == ORDER_STATUS.SUCCESS
+
+
+def test_ev5_flat_schedule_uses_root_app_mode_and_scope_specific_wire_contracts():
+    api, token, vehicle = setup()
+    api._vehicle_profiles[vehicle.id]["appMode"] = "EV5"
+    detail = {
+        "reservChargeSet": True,
+        "reservInfo": {"day": [1], "time": {"time": "0800", "timeSection": 0}},
+        "reservFatcSet": {
+            "airCtrl": 1,
+            "defrost": False,
+            "airTemp": {"value": "0CH", "unit": 0, "hvacTempType": 1},
+        },
+    }
+    current = {
+        "reservFlag": 1,
+        "reservChargeInfo": {"reservChargeInfoDetail": detail},
+        "reservChargeInfo2": {"reservChargeInfoDetail": copy.deepcopy(detail)},
+        "offPeakPowerInfo": {
+            "offPeakPowerFlag": 2,
+            "offPeakPowerTime1": {
+                "starttime": {"time": "1000", "timeSection": 1},
+                "endtime": {"time": "0700", "timeSection": 0},
+            },
+        },
+    }
+    api._payload = lambda result: result["resMsg"]
+    api._request.side_effect = [
+        {"controlToken": "synthetic-control", "expiresTime": 60},
+        {"resMsg": current},
+    ]
+    api._japan_command = Mock(side_effect=["charge-id", "climate-id"])
+    api.schedule_charging_and_climate(
+        token,
+        vehicle,
+        ScheduleChargingClimateRequestOptions(charging_enabled=False, temperature=20),
+    )
+    charge, climate = api._japan_command.call_args_list
+    assert charge.args[2] == "reservation/charge"
+    assert set(charge.args[3]) == {
+        "reservFlag",
+        "offpeakPowerFlag",
+        "reservStartTime",
+        "reservEndTime",
+    }
+    assert climate.args[2] == "reservation/hvac"
+    assert set(climate.args[3]) == {"reservedHVACInfo1", "reservedHVACInfo2"}
+    assert (
+        climate.args[3]["reservedHVACInfo1"]["reservHVACSet"]["airTemp"]["value"]
+        == "0CH"
+    )
