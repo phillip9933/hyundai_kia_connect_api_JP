@@ -1,0 +1,353 @@
+"""Japan MQTT contract tests: HTTP and MQTT are fully mocked."""
+
+import json
+import ssl
+from types import SimpleNamespace
+from unittest.mock import Mock
+
+import pytest
+
+from hyundai_kia_connect_api.const import ORDER_STATUS
+from hyundai_kia_connect_api.exceptions import (
+    APIError,
+    InvalidAPIResponseError,
+    RequestTimeoutError,
+)
+from hyundai_kia_connect_api.japan_mqtt import JapanMqttSession
+from hyundai_kia_connect_api.Token import Token
+
+
+class FakeClient:
+    def __init__(self, *args, **kwargs):
+        self.args = args
+        self.kwargs = kwargs
+        self.username_pw_set = Mock()
+        self.tls_set_context = Mock()
+        self.connect_async = Mock()
+        self.disconnect = Mock()
+        self.loop_stop = Mock()
+        self.subscribe = Mock(return_value=(0, 7))
+        self.grant = [1, 1, 1]
+        self.connect_code = 0
+
+    def loop_start(self):
+        self.on_connect(self, None, {}, self.connect_code, None)
+        if self.connect_code == 0:
+            self.on_subscribe(self, None, 7, self.grant, None)
+        return 0
+
+
+def response(payload, status=200):
+    result = Mock(status_code=status)
+    result.json.return_value = payload
+    return result
+
+
+@pytest.fixture
+def session(monkeypatch):
+    instance = JapanMqttSession(
+        Token(access_token="Bearer synthetic-access"),
+        "synthetic-vehicle",
+        "synthetic-uuid",
+        lambda: {
+            "Authorization": "Bearer synthetic-access",
+            "Stamp": "synthetic-stamp",
+        },
+    )
+    instance._http_session = Mock()
+    instance._http_session.request.side_effect = [
+        response(
+            {
+                "mqtt": {
+                    "host": "broker.ap-northeast.hmgmobility.com",
+                    "port": 8883,
+                    "ssl": True,
+                },
+                "tid": "synthetic-tid",
+            }
+        ),
+        response({"clientId": "synthetic-client", "deviceId": "synthetic-device"}),
+        response({"vehicles": [{"unit": "ccu", "vehicleId": "synthetic-vehicle"}]}),
+        response({}),
+    ]
+    client = FakeClient()
+    monkeypatch.setattr(
+        "hyundai_kia_connect_api.japan_mqtt.mqtt.Client", lambda *args, **kwargs: client
+    )
+    yield instance, client
+    instance.close()
+
+
+def message(topic, payload, retained=False):
+    return SimpleNamespace(
+        topic=topic, payload=json.dumps(payload).encode(), retain=retained
+    )
+
+
+def test_prepare_registers_and_subscribes_with_tls(session):
+    instance, client = session
+    instance.prepare()
+    calls = instance._http_session.request.call_args_list
+    assert calls[1].kwargs["json"] == {"unit": "mobile", "uuid": "synthetic-uuid_BLU"}
+    assert calls[2].kwargs["params"] == {"carId": "synthetic-vehicle", "brand": "H"}
+    assert calls[3].kwargs["json"]["protocols"] == [
+        "service.phone.vss",
+        "service.phone.connection",
+        "service.phone.res",
+    ]
+    assert all(call.kwargs["allow_redirects"] is False for call in calls)
+    client.username_pw_set.assert_called_once_with(
+        "synthetic-client", "synthetic-access"
+    )
+    context = client.tls_set_context.call_args.args[0]
+    assert context.verify_mode == ssl.CERT_REQUIRED
+    assert context.check_hostname is True
+    client.connect_async.assert_called_once_with(
+        "broker.ap-northeast.hmgmobility.com", 8883, keepalive=15
+    )
+    client.subscribe.assert_called_once_with(
+        [
+            ("service/phone/_/vss/synthetic-vehicle", 1),
+            ("service/phone/_/res/synthetic-client", 1),
+            ("service/phone/_/connection/synthetic-vehicle", 1),
+        ]
+    )
+    instance.prepare()
+    assert len(instance._http_session.request.call_args_list) == 4
+
+
+@pytest.mark.parametrize(
+    "host",
+    [
+        "attacker.example",
+        "ap-northeast.hmgmobility.com.attacker.example",
+        "https://broker.ap-northeast.hmgmobility.com",
+        "broker.ap-northeast.hmgmobility.com/",
+        "broker..ap-northeast.hmgmobility.com",
+        "user@broker.ap-northeast.hmgmobility.com",
+    ],
+)
+def test_untrusted_broker_is_rejected_before_credentials(host):
+    with pytest.raises(InvalidAPIResponseError):
+        JapanMqttSession._broker({"mqtt": {"host": host, "port": 8883, "ssl": True}})
+
+
+@pytest.mark.parametrize(
+    "port,secure",
+    [
+        (0, True),
+        (65536, True),
+        (True, True),
+        ("8883", True),
+        (8883, False),
+        (8883, "true"),
+    ],
+)
+def test_invalid_port_and_tls_are_rejected(port, secure):
+    with pytest.raises(InvalidAPIResponseError):
+        JapanMqttSession._broker(
+            {
+                "mqtt": {
+                    "host": "broker.ap-northeast.hmgmobility.com",
+                    "port": port,
+                    "ssl": secure,
+                }
+            }
+        )
+
+
+def test_matching_completion_before_http_ack_is_preserved(session):
+    instance, client = session
+    instance.prepare()
+    instance._on_message(
+        client,
+        None,
+        message(
+            instance._topics[1],
+            {"sid": "synthetic-action", "res-msg": "S", "res-code": "0000"},
+        ),
+    )
+    instance.track("synthetic-action")
+    assert instance.status("synthetic-action") == ORDER_STATUS.SUCCESS
+
+
+def test_wrong_sid_retained_and_other_topics_do_not_complete_command(session):
+    instance, client = session
+    instance.prepare()
+    instance.track("synthetic-action")
+    for topic, sid, retained in [
+        (instance._topics[1], "other-action", False),
+        (instance._topics[1], "synthetic-action", True),
+        ("unrelated/topic", "synthetic-action", False),
+    ]:
+        instance._on_message(
+            client, None, message(topic, {"sid": sid, "res-msg": "S"}, retained)
+        )
+    assert instance.status("synthetic-action") == ORDER_STATUS.PENDING
+    assert instance.status("synthetic-action", timeout=0.001) == ORDER_STATUS.TIMEOUT
+
+
+def test_failure_message_is_not_assumed_success(session):
+    instance, client = session
+    instance.prepare()
+    instance.track("synthetic-action")
+    instance._on_message(
+        client,
+        None,
+        message(
+            instance._topics[1],
+            {"sid": "synthetic-action", "res-msg": "F", "res-code": "5000"},
+        ),
+    )
+    assert instance.status("synthetic-action") == ORDER_STATUS.FAILED
+
+
+def test_latest_vss_state_is_copied(session):
+    instance, client = session
+    instance.prepare()
+    instance._on_message(
+        client,
+        None,
+        message(instance._topics[0], {"state": {"Vehicle": {"synthetic-value": 1}}}),
+    )
+    state = instance.latest_state
+    state["synthetic-value"] = 2
+    assert instance.latest_state == {"synthetic-value": 1}
+
+
+@pytest.mark.parametrize("grant", [[0, 0, 0], [128, 1, 1], [1]])
+def test_subscription_failure_disconnects_without_command(session, grant):
+    instance, client = session
+    client.grant = grant
+    with pytest.raises(APIError, match="QoS 1"):
+        instance.prepare()
+    client.disconnect.assert_called_once()
+    client.loop_stop.assert_called_once()
+
+
+def test_connection_failure_disconnects(session):
+    instance, client = session
+    client.connect_code = 5
+    with pytest.raises(APIError, match="connection was rejected"):
+        instance.prepare()
+    client.disconnect.assert_called_once()
+
+
+def test_disconnect_interrupts_wait(session):
+    instance, client = session
+    instance.prepare()
+    instance.track("synthetic-action")
+    instance._on_disconnect(client, None, {}, 1, None)
+    with pytest.raises(APIError, match="connection was lost"):
+        instance.status("synthetic-action")
+
+
+def test_missing_suback_times_out_and_closes(session, monkeypatch):
+    instance, client = session
+    monkeypatch.setattr(instance, "CONNECT_TIMEOUT", 0.001)
+
+    def start():
+        instance._on_connect(client, None, {}, 0, None)
+        return 0
+
+    client.loop_start = start
+    with pytest.raises(RequestTimeoutError):
+        instance.prepare()
+    client.disconnect.assert_called_once()
+
+
+def test_close_is_idempotent_and_clears_state(session):
+    instance, client = session
+    instance.prepare()
+    instance.close()
+    instance.close()
+    client.disconnect.assert_called_once()
+    client.loop_stop.assert_called_once()
+    assert instance.latest_state is None
+    with pytest.raises(APIError, match="closed"):
+        instance.prepare()
+
+
+def test_malformed_payloads_are_ignored(session):
+    instance, client = session
+    instance.prepare()
+    instance.track("synthetic-action")
+    for payload in (b"not-json", b"[]", b"\xff"):
+        instance._on_message(
+            client,
+            None,
+            SimpleNamespace(topic=instance._topics[1], payload=payload, retain=False),
+        )
+    assert instance.status("synthetic-action") == ORDER_STATUS.PENDING
+
+
+def test_metadata_broker_identity_differs_from_api_car_id(session):
+    instance, _client = session
+    replies = list(instance._http_session.request.side_effect)
+    replies[2] = response(
+        {
+            "vehicles": [
+                {"unit": "tmu", "vehicleId": "synthetic-tmu"},
+                {"unit": "ccu", "vehicleId": "synthetic-ccu"},
+            ]
+        }
+    )
+    instance._http_session.request.side_effect = replies
+    instance.prepare()
+    assert (
+        instance._http_session.request.call_args_list[2].kwargs["params"]["carId"]
+        == "synthetic-vehicle"
+    )
+    assert instance._topics[0].endswith("/synthetic-ccu")
+    assert instance._topics[2].endswith("/synthetic-ccu")
+
+
+@pytest.mark.parametrize("missing", [response({"vehicles": []}), response({}, 404)])
+def test_missing_metadata_is_created_then_fetched(session, missing):
+    instance, _client = session
+    replies = list(instance._http_session.request.side_effect)
+    instance._http_session.request.side_effect = [
+        replies[0],
+        replies[1],
+        missing,
+        response({"vehicleId": "synthetic-created"}),
+        response({"vehicles": [{"unit": "tmu", "vehicleId": "synthetic-created"}]}),
+        replies[3],
+    ]
+    instance.prepare()
+    calls = instance._http_session.request.call_args_list
+    assert calls[3].args == (
+        "POST",
+        instance.SERVICEHUB_URL + "/api/v3/servicehub/vehicleId",
+    )
+    assert calls[3].kwargs["json"] == {"carId": "synthetic-vehicle", "brand": "H"}
+    assert calls[4].args[0] == "GET"
+    assert instance._topics[0].endswith("/synthetic-created")
+
+
+def test_missing_unit_does_not_assume_car_id_is_topic_identity():
+    assert (
+        JapanMqttSession._metadata_vehicle_id(
+            {"vehicles": [{"vehicleId": "synthetic-vehicle"}]}
+        )
+        is None
+    )
+    with pytest.raises(InvalidAPIResponseError):
+        JapanMqttSession._metadata_vehicle_id(
+            {"vehicles": [{"unit": "ccu", "vehicleId": "synthetic/#"}]}
+        )
+
+
+def test_requests_json_decode_error_has_typed_safe_response(session):
+    import requests
+
+    instance, _client = session
+    invalid = response(None)
+    invalid.json.side_effect = requests.exceptions.JSONDecodeError(
+        "synthetic-secret", "invalid", 0
+    )
+    instance._http_session.request.side_effect = [invalid]
+    with pytest.raises(InvalidAPIResponseError) as caught:
+        instance.prepare()
+    assert "synthetic-secret" not in str(caught.value)
+    assert instance._client is None
