@@ -11,6 +11,7 @@ import math
 import re
 import time
 import uuid
+from typing import ClassVar
 from urllib.parse import parse_qs, urljoin, urlparse
 from zoneinfo import ZoneInfo
 
@@ -23,7 +24,7 @@ from .exceptions import (
     APIError,
     AuthenticationError,
     ConsentRequiredError,
-    DeviceIDError,
+    DuplicateRequestError,
     InvalidAPIResponseError,
     NoDataFound,
     RateLimitingError,
@@ -117,7 +118,7 @@ class HyundaiBlueLinkApiJP(JapanCommandsMixin, JapanSVM, ApiImpl):
                 token,
                 vehicle.id,
                 token.mqtt_registration_uuid,
-                lambda: self._headers(token),
+                lambda: self._vehicle_headers(token, vehicle),
             )
             self._mqtt_sessions[vehicle.id] = (identity, helper)
             return helper
@@ -133,7 +134,7 @@ class HyundaiBlueLinkApiJP(JapanCommandsMixin, JapanSVM, ApiImpl):
     def force_refresh_vehicle_state(self, token: Token, vehicle: Vehicle) -> None:
         """Wait for correlated completion and newer telemetry, never just an ACK."""
         self._command_vehicle_id(vehicle)
-        headers = self._control_headers(token)
+        headers = self._control_headers(token, vehicle)
         helper = self._mqtt_for_vehicle(token, vehicle)
         try:
             self._force_refresh_with_session(token, vehicle, helper, headers)
@@ -143,6 +144,9 @@ class HyundaiBlueLinkApiJP(JapanCommandsMixin, JapanSVM, ApiImpl):
     def _force_refresh_with_session(self, token, vehicle, helper, headers):
         vehicle_id = self._command_vehicle_id(vehicle)
         helper.prepare()
+        authorization = headers["Authorization"]
+        headers = self._vehicle_headers(token, vehicle, helper)
+        headers["Authorization"] = authorization
         deadline = time.monotonic() + self.FORCE_REFRESH_TIMEOUT
         started_at = dt.datetime.now(dt.UTC).replace(microsecond=0)
         result = self._request(
@@ -274,67 +278,135 @@ class HyundaiBlueLinkApiJP(JapanCommandsMixin, JapanSVM, ApiImpl):
             headers["ccsp-device-id"] = token.device_id
         return headers
 
+    def _vehicle_headers(self, token: Token, vehicle: Vehicle, helper=None) -> dict:
+        """Add only known protocol and authenticated, prepared broker context."""
+        headers = self._headers(token)
+        protocol = vehicle.ccu_ccs2_protocol_support
+        if protocol is not None:
+            if type(protocol) is not int or protocol < 0:
+                raise InvalidAPIResponseError(
+                    "Japan vehicle status protocol is invalid"
+                )
+            headers["ccuCCS2ProtocolSupport"] = str(protocol)
+        if helper is None:
+            cached = self._mqtt_sessions.get(vehicle.id)
+            identity = (
+                token.access_token,
+                token.device_id,
+                token.mqtt_registration_uuid,
+            )
+            if cached is not None and cached[0] == identity:
+                helper = cached[1]
+        context = getattr(helper, "request_context", {})
+        if isinstance(context, dict):
+            for key in ("clientId", "vehicleId"):
+                value = context.get(key)
+                if isinstance(value, str) and re.fullmatch(
+                    r"[A-Za-z0-9_.:-]{1,256}", value
+                ):
+                    headers[key] = value
+        return headers
+
+    _KNOWN_ERRORS: ClassVar[dict[str, tuple[type[Exception], str]]] = {
+        "4002": (APIError, "invalid request"),
+        "4003": (APIError, "invalid value"),
+        "4004": (DuplicateRequestError, "duplicate request"),
+        "4006": (APIError, "account locked"),
+        "4016": (APIError, "account migration required"),
+        "4081": (RequestTimeoutError, "request expired"),
+        "5031": (ServiceTemporaryUnavailable, "remote control unavailable"),
+        "5091": (RateLimitingError, "request limit reached"),
+        "5911": (NoDataFound, "no data found"),
+        "5921": (NoDataFound, "no data found"),
+        "7501": (AuthenticationError, "authentication expired"),
+        "4292": (RateLimitingError, "surround-view capture limit reached"),
+        "7779": (ServiceTemporaryUnavailable, "surround-view unavailable"),
+        "7780": (APIError, "surround-view camera error"),
+        "7781": (APIError, "surround-view blocked by emergency lights"),
+        "7782": (APIError, "surround-view blocked by low battery"),
+        "5016": (APIError, "vehicle has not uploaded data"),
+        "4101": (APIError, "vehicle is not registered"),
+        "4140": (APIError, "vehicle profile is not owned by this account"),
+        "4008": (APIError, "vehicle system is updating"),
+        "4901": (APIError, "vehicle is immobilized"),
+        "5311": (APIError, "stolen-vehicle remote control unavailable"),
+        "5152": (APIError, "no GPS data found"),
+        "4011": (APIError, "verification number is incorrect"),
+        "4291": (APIError, "authentication already processed"),
+    }
+
+    @classmethod
+    def _diagnostic(cls, http_status, result: dict) -> str:
+        details = []
+        if type(http_status) is int and 100 <= http_status <= 599:
+            details.append(f"HTTP {http_status}")
+        code = str(
+            result.get("resCode", result.get("resultCode", result.get("errCode", "")))
+        )
+        known = cls._KNOWN_ERRORS.get(code)
+        if known is not None:
+            details.append(f"code {code}: {known[1]}")
+        return " (" + ", ".join(details) + ")" if details else ""
+
     def _request(self, method: str, path: str, *, json_response=True, **kwargs):
-        """Translate errors without exposing URLs, payloads, or vendor messages."""
+        """Expose HTTP status and allowlisted labels, never response text or URLs."""
         kwargs.setdefault("allow_redirects", False)
         try:
             response = self.session.request(method, self.BASE_URL + path, **kwargs)
-            if response.status_code in (401, 403):
-                raise AuthenticationError("Japan authentication was rejected")
-            if response.status_code == 429:
-                raise RateLimitingError("Japan API rate limit reached")
-            if response.status_code >= 500:
-                raise ServiceTemporaryUnavailable("Japan API is unavailable")
-            if response.status_code == 400:
-                try:
-                    error_result = response.json()
-                except ValueError:
-                    error_result = None
-                if isinstance(error_result, dict):
-                    if error_result.get("error") in ("invalid_grant", "invalid_token"):
-                        raise AuthenticationError("Japan token grant was rejected")
-                    if str(error_result.get("resCode")) in ("4003", "4006", "4016"):
-                        raise AuthenticationError("Japan authentication was rejected")
-            if not json_response and 300 <= response.status_code < 400:
-                return response
-            if not 200 <= response.status_code < 300:
-                raise APIError("Japan API request was rejected")
-            if not json_response:
-                return response
-            result = response.json()
         except (requests.exceptions.Timeout, RequestTimeoutError):
             raise RequestTimeoutError("Japan API request timed out") from None
-        except ValueError:
-            raise InvalidAPIResponseError("Japan API returned invalid JSON") from None
         except requests.exceptions.RequestException:
             raise APIError("Japan API connection failed") from None
+        status = response.status_code
+        if not json_response and (200 <= status < 300 or 300 <= status < 400):
+            return response
+        try:
+            result = response.json()
+        except ValueError:
+            if 200 <= status < 300:
+                raise InvalidAPIResponseError(
+                    f"Japan API returned invalid JSON (HTTP {status})"
+                ) from None
+            result = {}
         if not isinstance(result, dict):
-            raise InvalidAPIResponseError("Japan API returned an invalid object")
-        self._check_errors(result)
+            if 200 <= status < 300:
+                raise InvalidAPIResponseError(
+                    f"Japan API returned an invalid object (HTTP {status})"
+                )
+            result = {}
+        diagnostic = self._diagnostic(status, result)
+        if status in (401, 403):
+            raise AuthenticationError("Japan authentication was rejected" + diagnostic)
+        if status == 429:
+            raise RateLimitingError("Japan API rate limit reached" + diagnostic)
+        if status >= 500:
+            raise ServiceTemporaryUnavailable("Japan API is unavailable" + diagnostic)
+        self._check_errors(result, http_status=status, path=path)
+        if not 200 <= status < 300:
+            raise APIError("Japan API request was rejected" + diagnostic)
         return result
 
-    @staticmethod
-    def _check_errors(result: dict) -> None:
-        code = str(result.get("resCode", result.get("resultCode", "")))
-        error = {
-            "4002": DeviceIDError,
-            "4003": AuthenticationError,
-            "4006": AuthenticationError,
-            "4016": AuthenticationError,
-            "4081": RequestTimeoutError,
-            "5031": ServiceTemporaryUnavailable,
-            "5091": RateLimitingError,
-            "5921": NoDataFound,
-            "7501": AuthenticationError,
-        }.get(code)
-        if error is not None:
-            raise error("Japan API rejected the request")
-        if result.get("retCode", result.get("resultType")) == "F":
-            raise APIError("Japan API rejected the request")
-        if code and code != "0000":
-            raise APIError("Japan API rejected the request")
-        if result.get("error"):
-            raise AuthenticationError("Japan token grant was rejected")
+    @classmethod
+    def _check_errors(cls, result: dict, *, http_status=None, path=None) -> None:
+        code = str(
+            result.get("resCode", result.get("resultCode", result.get("errCode", "")))
+        )
+        diagnostic = cls._diagnostic(http_status, result)
+        if path == "/api/v1/user/signin" and code in ("4003", "4006", "4016"):
+            raise AuthenticationError("Japan sign-in was rejected" + diagnostic)
+        if path == "/api/v1/user/pin" and code == "4003":
+            raise AuthenticationError("Japan PIN was rejected" + diagnostic)
+        if result.get("error") in ("invalid_grant", "invalid_token"):
+            raise AuthenticationError("Japan token grant was rejected" + diagnostic)
+        known = cls._KNOWN_ERRORS.get(code)
+        if known is not None:
+            raise known[0]("Japan API rejected the request" + diagnostic)
+        if (
+            result.get("retCode", result.get("resultType")) == "F"
+            or (code and code != "0000")
+            or result.get("error")
+        ):
+            raise APIError("Japan API rejected the request" + diagnostic)
 
     @staticmethod
     def _payload(result: dict) -> dict:
@@ -515,7 +587,7 @@ class HyundaiBlueLinkApiJP(JapanCommandsMixin, JapanSVM, ApiImpl):
             result = self._request(
                 "GET",
                 f"/api/v1/spa/vehicles/{vehicle_id}/profile",
-                headers=self._headers(token),
+                headers=self._vehicle_headers(token, Vehicle(id=vehicle_id)),
             )
             profiles = self._payload(result).get("vinInfo")
             if not isinstance(profiles, list) or len(profiles) != 1:
@@ -555,7 +627,7 @@ class HyundaiBlueLinkApiJP(JapanCommandsMixin, JapanSVM, ApiImpl):
         ):
             raise InvalidAPIResponseError("Japan vehicle identifier is invalid")
         endpoint = "ccs2/carstatus/latest" if protocol else "status/latest"
-        headers = self._headers(token)
+        headers = self._vehicle_headers(token, vehicle)
         headers["ccuCCS2ProtocolSupport"] = str(protocol)
         payload = self._payload(
             self._request(
@@ -678,7 +750,7 @@ class HyundaiBlueLinkApiJP(JapanCommandsMixin, JapanSVM, ApiImpl):
             self._request(
                 "GET",
                 f"/api/v1/spa/vehicles/{vehicle_id}/charge/target",
-                headers=self._headers(token),
+                headers=self._vehicle_headers(token, vehicle),
             )
         )
         entries = payload.get("targetSOClist")
@@ -756,7 +828,7 @@ class HyundaiBlueLinkApiJP(JapanCommandsMixin, JapanSVM, ApiImpl):
             self._request(
                 "GET",
                 f"/api/v1/spa/vehicles/{vehicle.id}/location/park",
-                headers=self._headers(token),
+                headers=self._vehicle_headers(token, vehicle),
             )
         )
         location = payload.get("gpsDetail", payload)
@@ -794,7 +866,7 @@ class HyundaiBlueLinkApiJP(JapanCommandsMixin, JapanSVM, ApiImpl):
             self._request(
                 "POST",
                 f"/api/v1/spa/vehicles/{vehicle.id}/drvhistory",
-                headers=self._headers(token),
+                headers=self._vehicle_headers(token, vehicle),
                 json={"periodTarget": 0},
             )
         )

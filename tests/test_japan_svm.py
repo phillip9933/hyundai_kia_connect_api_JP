@@ -8,6 +8,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from hyundai_kia_connect_api.exceptions import (
+    AuthenticationError,
     InvalidAPIResponseError,
     NoDataFound,
     RequestTimeoutError,
@@ -36,6 +37,16 @@ def adapter():
     api = JapanSVM()
     api.data_timezone = ZoneInfo("Asia/Tokyo")
     api._headers = Mock(return_value={"Authorization": "SYNTHETIC_TOKEN"})
+    api._control_headers = Mock(
+        return_value={"Authorization": "SYNTHETIC_CONTROL_TOKEN"}
+    )
+    api._vehicle_headers = Mock(
+        return_value={
+            "Authorization": "SYNTHETIC_OAUTH_TOKEN",
+            "vehicleId": "CAR",
+            "ccuCCS2ProtocolSupport": "0",
+        }
+    )
     api._payload = lambda response: response["resMsg"]
     api._request = Mock()
     return api
@@ -97,9 +108,41 @@ def test_poll_is_correlated_and_only_retries_pending(adapter, monkeypatch):
     assert adapter._request.call_count == 3
     calls = adapter._request.call_args_list
     assert calls[0].args == ("POST", "/api/v1/spa/vehicles/CAR/svm/async")
+    adapter._control_headers.assert_called_once_with(None, vehicle)
+    assert all(
+        call.kwargs["headers"]["Authorization"] == "SYNTHETIC_OAUTH_TOKEN"
+        for call in calls
+    )
+    assert all(call.kwargs["headers"]["vehicleId"] == "CAR" for call in calls)
     assert all(call.kwargs["params"] == {"msgId": "SYNTHETIC_ID"} for call in calls[1:])
     assert adapter.get_svm_details(None, vehicle) is result
     assert adapter._request.call_count == 3
+
+
+def test_pin_precondition_failure_never_submits_or_polls_camera(adapter):
+    adapter._control_headers.side_effect = AuthenticationError("PIN rejected")
+    with pytest.raises(AuthenticationError):
+        adapter.request_svm_capture(None, Vehicle(id="CAR", supports_svm=True), True)
+    adapter._request.assert_not_called()
+    adapter._vehicle_headers.assert_not_called()
+
+
+def test_pin_precondition_precedes_camera_oauth_context_and_post(adapter):
+    order = []
+    adapter._control_headers.side_effect = lambda token, vehicle: (
+        order.append("PIN") or {"Authorization": "CONTROL"}
+    )
+    adapter._vehicle_headers.side_effect = lambda token, vehicle: (
+        order.append("OAuth context") or {"Authorization": "OAUTH"}
+    )
+
+    def request(method, path, **kwargs):
+        order.append(method)
+        return {"msgId": "SYNTHETIC_ID"} if method == "POST" else {"resMsg": payload()}
+
+    adapter._request.side_effect = request
+    adapter.request_svm_capture(None, Vehicle(id="CAR", supports_svm=True), True)
+    assert order == ["PIN", "OAuth context", "POST", "OAuth context", "GET"]
 
 
 def test_ack_without_image_is_not_success(adapter):

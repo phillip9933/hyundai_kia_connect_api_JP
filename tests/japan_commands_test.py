@@ -39,6 +39,7 @@ class Adapter(JapanCommandsMixin):
             ]
         )
         self.helper = Mock()
+        self.helper.request_context = {}
         self.helper.status.return_value = ORDER_STATUS.PENDING
         self._mqtt_for_vehicle = Mock(return_value=self.helper)
         self._vehicle_profiles = {"synthetic-car": {"option": {"hvacTempType": 1}}}
@@ -46,6 +47,13 @@ class Adapter(JapanCommandsMixin):
 
     def _headers(self, token):
         return {"Authorization": "Bearer synthetic-access"}
+
+    def _vehicle_headers(self, token, vehicle, helper=None):
+        headers = self._headers(token)
+        headers["ccuCCS2ProtocolSupport"] = "1"
+        if helper is not None:
+            headers.update(helper.request_context)
+        return headers
 
     def _legacy_temperature(self, vehicle, payload):
         return 20.0 if payload["value"] == "0CH" else None
@@ -96,6 +104,26 @@ def test_exact_command_payload_and_pin_headers(method, args, endpoint, command):
         api.check_action_status(token, vehicle, "synthetic-action")
         == ORDER_STATUS.PENDING
     )
+
+
+def test_command_context_is_attached_after_prepare_not_before():
+    api, token, vehicle = setup()
+
+    def prepared():
+        api.helper.request_context = {
+            "clientId": "synthetic-client",
+            "vehicleId": "synthetic-broker-vehicle",
+        }
+
+    api.helper.prepare.side_effect = prepared
+    api.lock_action(token, vehicle, VEHICLE_LOCK_ACTION.UNLOCK)
+    request = api._request.call_args_list[-1]
+    assert request.kwargs["headers"]["clientId"] == "synthetic-client"
+    assert request.kwargs["headers"]["vehicleId"] == "synthetic-broker-vehicle"
+    assert request.kwargs["headers"]["ccuCCS2ProtocolSupport"] == "1"
+    assert request.kwargs["headers"]["Authorization"] == "Bearer synthetic-control"
+    assert request.kwargs["json"] == {"command": "DOOR_UNLOCK"}
+    assert "tid" not in request.kwargs["json"]
 
 
 def test_missing_pin_never_connects_or_submits():

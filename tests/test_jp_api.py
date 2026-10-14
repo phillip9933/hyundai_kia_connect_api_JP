@@ -12,9 +12,12 @@ from hyundai_kia_connect_api.exceptions import (
     APIError,
     AuthenticationError,
     ConsentRequiredError,
+    DuplicateRequestError,
     InvalidAPIResponseError,
+    NoDataFound,
     RateLimitingError,
     RequestTimeoutError,
+    ServiceTemporaryUnavailable,
 )
 from hyundai_kia_connect_api.HyundaiBlueLinkApiJP import HyundaiBlueLinkApiJP
 from hyundai_kia_connect_api.Token import Token
@@ -434,7 +437,7 @@ def test_discovery_keeps_multiple_vehicles_separate(api):
     [
         ({"error": "invalid_grant"}, AuthenticationError),
         ({"error": "invalid_token"}, AuthenticationError),
-        ({"resCode": "4003"}, AuthenticationError),
+        ({"resCode": "4003"}, APIError),
         ({"error": "invalid_request"}, APIError),
     ],
 )
@@ -663,6 +666,11 @@ def test_mqtt_registration_uuid_token_roundtrip_and_refresh(api):
 
 def test_force_refresh_requires_correlated_completion_and_newer_state(api, monkeypatch):
     helper = Mock()
+    helper.prepare.side_effect = lambda: setattr(
+        helper,
+        "request_context",
+        {"clientId": "synthetic-client", "vehicleId": "synthetic-broker"},
+    )
     helper.status.return_value = ORDER_STATUS.SUCCESS
     helper.latest_state = {
         "Date": dt.datetime.now(dt.UTC).strftime("%Y%m%d%H%M%S"),
@@ -671,7 +679,9 @@ def test_force_refresh_requires_correlated_completion_and_newer_state(api, monke
     }
     monkeypatch.setattr(api, "_mqtt_for_vehicle", lambda *args: helper)
     monkeypatch.setattr(
-        api, "_control_headers", lambda token: {"Authorization": "synthetic"}
+        api,
+        "_control_headers",
+        lambda token, vehicle=None: {"Authorization": "synthetic"},
     )
     api.session.request.return_value = response({"msgId": "synthetic-action"})
     vehicle = Vehicle(id="synthetic", ccu_ccs2_protocol_support=1)
@@ -682,6 +692,11 @@ def test_force_refresh_requires_correlated_completion_and_newer_state(api, monke
     assert vehicle.ev_battery_percentage == 70
     assert vehicle.total_driving_range == 321
     assert api.session.request.call_args.args[1].endswith("/ccs2/carstatus")
+    headers = api.session.request.call_args.kwargs["headers"]
+    assert headers["clientId"] == "synthetic-client"
+    assert headers["vehicleId"] == "synthetic-broker"
+    assert headers["ccuCCS2ProtocolSupport"] == "1"
+    assert headers["Authorization"] == "synthetic"
 
 
 @pytest.mark.parametrize(
@@ -692,7 +707,11 @@ def test_force_refresh_ack_does_not_mean_success(api, monkeypatch, status, error
     helper = Mock()
     helper.status.return_value = status
     monkeypatch.setattr(api, "_mqtt_for_vehicle", lambda *args: helper)
-    monkeypatch.setattr(api, "_control_headers", lambda token: {})
+    monkeypatch.setattr(
+        api,
+        "_control_headers",
+        lambda token, vehicle=None: {"Authorization": "synthetic"},
+    )
     api.session.request.return_value = response({"msgId": "synthetic-action"})
     vehicle = Vehicle(id="synthetic", ccu_ccs2_protocol_support=1)
     with pytest.raises(error):
@@ -705,7 +724,11 @@ def test_confirmed_refresh_without_new_telemetry_times_out(api, monkeypatch):
     helper.status.return_value = ORDER_STATUS.SUCCESS
     helper.latest_state = None
     monkeypatch.setattr(api, "_mqtt_for_vehicle", lambda *args: helper)
-    monkeypatch.setattr(api, "_control_headers", lambda token: {})
+    monkeypatch.setattr(
+        api,
+        "_control_headers",
+        lambda token, vehicle=None: {"Authorization": "synthetic"},
+    )
     monkeypatch.setattr(api, "update_vehicle_with_cached_state", lambda *args: None)
     api.FORCE_REFRESH_TIMEOUT = 0.001
     api.session.request.return_value = response({"msgId": "synthetic-action"})
@@ -720,7 +743,11 @@ def test_force_ignores_retained_state_and_uses_newer_cached_status(api, monkeypa
     helper.status.return_value = ORDER_STATUS.SUCCESS
     helper.latest_state = {"Date": "20261013090000"}
     monkeypatch.setattr(api, "_mqtt_for_vehicle", lambda *args: helper)
-    monkeypatch.setattr(api, "_control_headers", lambda token: {})
+    monkeypatch.setattr(
+        api,
+        "_control_headers",
+        lambda token, vehicle=None: {"Authorization": "synthetic"},
+    )
 
     def cached(token, candidate):
         candidate.last_updated_at = dt.datetime.now(dt.UTC)
@@ -749,7 +776,11 @@ def test_force_completion_before_vss_waits_for_newer_message(api, monkeypatch):
         raising=False,
     )
     monkeypatch.setattr(api, "_mqtt_for_vehicle", lambda *args: helper)
-    monkeypatch.setattr(api, "_control_headers", lambda token: {})
+    monkeypatch.setattr(
+        api,
+        "_control_headers",
+        lambda token, vehicle=None: {"Authorization": "synthetic"},
+    )
     monkeypatch.setattr(api, "update_vehicle_with_cached_state", lambda *args: None)
     monkeypatch.setattr("time.sleep", lambda *args: None)
     api.session.request.return_value = response({"msgId": "synthetic-action"})
@@ -942,3 +973,150 @@ def test_old_cached_only_token_requires_reauthentication_without_io(api):
     with pytest.raises(AuthenticationError, match="Reauthenticate"):
         api._mqtt_for_vehicle(Token(), Vehicle(id="synthetic"))
     api.session.request.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "code,error,label",
+    [
+        ("5911", NoDataFound, "no data found"),
+        ("5921", NoDataFound, "no data found"),
+        ("4004", DuplicateRequestError, "duplicate request"),
+        ("4292", RateLimitingError, "surround-view capture limit"),
+        ("7779", ServiceTemporaryUnavailable, "surround-view unavailable"),
+        ("7780", APIError, "camera error"),
+        ("7781", APIError, "emergency lights"),
+        ("7782", APIError, "low battery"),
+    ],
+)
+def test_public_vendor_diagnostics_are_sanitized_on_http_error(
+    api, caplog, code, error, label
+):
+    secret = "SYNTHETIC_PASSWORD_TOKEN_VIN_COORDINATES"
+    api.session.request.return_value = response(
+        {"retCode": "F", "resCode": code, "resMsg": secret}, 400
+    )
+    with caplog.at_level(logging.DEBUG), pytest.raises(error) as raised:
+        api._request("POST", "/api/v1/spa/vehicles/synthetic/svm/async")
+    assert "HTTP 400" in str(raised.value)
+    assert code in str(raised.value) and label in str(raised.value)
+    assert secret not in str(raised.value) + caplog.text
+
+
+def test_unknown_vendor_code_is_not_echoed(api):
+    secret = "SYNTHETIC_SECRET_IN_CODE"
+    api.session.request.return_value = response(
+        {"resCode": secret, "resMsg": secret}, 400
+    )
+    with pytest.raises(APIError) as raised:
+        api._request("POST", "/api/v1/spa/vehicles/synthetic/svm/async")
+    assert "HTTP 400" in str(raised.value)
+    assert secret not in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    "path,error,label",
+    [
+        ("/api/v1/user/signin", AuthenticationError, "sign-in"),
+        ("/api/v1/user/pin", AuthenticationError, "PIN"),
+        ("/api/v1/spa/vehicles/synthetic/svm/async", APIError, "invalid value"),
+    ],
+)
+def test_invalid_value_is_classified_in_request_context(api, path, error, label):
+    api.session.request.return_value = response(
+        {"retCode": "F", "resCode": "4003"}, 400
+    )
+    with pytest.raises(error) as raised:
+        api._request("POST", path)
+    assert type(raised.value) is error
+    assert label in str(raised.value)
+
+
+def test_invalid_request_is_not_assumed_to_be_invalid_device_id(api):
+    api.session.request.return_value = response({"resCode": "4002"}, 400)
+    with pytest.raises(APIError) as raised:
+        api._request("POST", "/api/v1/spa/vehicles/synthetic/svm/async")
+    assert type(raised.value) is APIError
+    assert "invalid request" in str(raised.value)
+
+
+def test_vehicle_headers_use_protocol_and_ready_context_only(api):
+    token = Token(
+        access_token="Bearer synthetic",
+        device_id="synthetic-device",
+        mqtt_registration_uuid="synthetic-registration",
+    )
+    vehicle = Vehicle(id="synthetic", ccu_ccs2_protocol_support=1)
+    helper = Mock()
+    helper.request_context = {
+        "clientId": "synthetic-client",
+        "vehicleId": "synthetic-broker",
+        "Authorization": "forbidden",
+    }
+    headers = api._vehicle_headers(token, vehicle, helper)
+    assert headers["ccuCCS2ProtocolSupport"] == "1"
+    assert headers["clientId"] == "synthetic-client"
+    assert headers["vehicleId"] == "synthetic-broker"
+    assert headers["Authorization"] == "Bearer synthetic"
+
+
+def test_real_adapter_camera_http_5911_polls_then_returns_image(api, monkeypatch):
+    monkeypatch.setattr("time.sleep", lambda seconds: None)
+    api.session.request.side_effect = [
+        response({"controlToken": "synthetic-control", "expiresTime": 60}),
+        response({"retCode": "S", "resCode": "0000", "msgId": "synthetic-capture"}),
+        response(
+            {
+                "retCode": "F",
+                "resCode": "5911",
+                "resMsg": "SYNTHETIC_PRIVATE_VENDOR_TEXT",
+            },
+            400,
+        ),
+        response(envelope({"scsDetail": {"svmImage": "U1lOVEhFVElDX0lNQUdF"}})),
+    ]
+    token = Token(
+        access_token="Bearer synthetic-access",
+        device_id="synthetic-device",
+        pin="1234",
+        mqtt_registration_uuid="synthetic-registration",
+    )
+    vehicle = Vehicle(id="synthetic", ccu_ccs2_protocol_support=1, supports_svm=True)
+    image = api.request_svm_capture(token, vehicle, acknowledged_warning=True)
+    assert image.image_bytes == b"SYNTHETIC_IMAGE"
+    calls = api.session.request.call_args_list
+    assert [call.args[0] for call in calls] == ["PUT", "POST", "GET", "GET"]
+    assert all(
+        call.kwargs["headers"]["Authorization"] == "Bearer synthetic-access"
+        for call in calls[1:]
+    )
+    assert (
+        calls[2].kwargs["params"]
+        == calls[3].kwargs["params"]
+        == {"msgId": "synthetic-capture"}
+    )
+    assert api.get_svm_details(token, vehicle) is image
+
+
+@pytest.mark.parametrize(
+    "code,label",
+    [
+        ("5016", "not uploaded"),
+        ("4101", "not registered"),
+        ("4140", "not owned"),
+        ("4008", "updating"),
+        ("4901", "immobilized"),
+        ("5311", "stolen-vehicle"),
+        ("5152", "GPS"),
+        ("4011", "verification"),
+        ("4291", "already processed"),
+    ],
+)
+def test_additional_public_server_error_labels_are_fixed(api, code, label):
+    secret = "SYNTHETIC_PRIVATE_VENDOR_MESSAGE"
+    api.session.request.return_value = response(
+        {"retCode": "F", "resCode": code, "resMsg": secret}, 400
+    )
+    with pytest.raises(APIError) as raised:
+        api._request("POST", "/api/v1/spa/vehicles/synthetic/svm/async")
+    assert code in str(raised.value) and label in str(raised.value)
+    assert secret not in str(raised.value)

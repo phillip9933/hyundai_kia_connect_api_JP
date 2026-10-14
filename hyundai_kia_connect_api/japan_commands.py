@@ -54,7 +54,7 @@ class JapanCommandsMixin:
                 "Sign in again to register Japan vehicle commands"
             )
 
-    def _control_headers(self, token):
+    def _control_headers(self, token, vehicle=None):
         self._require_mqtt_identity(token)
         if not isinstance(token.pin, str) or not token.pin.strip():
             raise AuthenticationError("Japan vehicle commands require an explicit PIN")
@@ -62,7 +62,9 @@ class JapanCommandsMixin:
             result = self._request(
                 "PUT",
                 "/api/v1/user/pin",
-                headers=self._headers(token),
+                headers=self._vehicle_headers(token, vehicle)
+                if vehicle is not None
+                else self._headers(token),
                 json={"deviceId": token.device_id, "pin": token.pin},
             )
             control = result.get("controlToken")
@@ -78,7 +80,11 @@ class JapanCommandsMixin:
                 raise InvalidAPIResponseError("Japan control token is incomplete")
             token.control_token = "Bearer " + control
             token.control_token_expiry = time.time() + expires
-        headers = self._headers(token)
+        headers = (
+            self._vehicle_headers(token, vehicle)
+            if vehicle is not None
+            else self._headers(token)
+        )
         headers["Authorization"] = token.control_token
         return headers
 
@@ -94,10 +100,13 @@ class JapanCommandsMixin:
     def _japan_command(self, token, vehicle, endpoint, payload, *, ccs2=True):
         vehicle_id = self._command_vehicle_id(vehicle)
         # Validate PIN before connecting MQTT or performing any command request.
-        headers = self._control_headers(token)
+        headers = self._control_headers(token, vehicle)
         helper = self._mqtt_for_vehicle(token, vehicle)
         try:
             helper.prepare()
+            authorization = headers["Authorization"]
+            headers = self._vehicle_headers(token, vehicle, helper)
+            headers["Authorization"] = authorization
             result = self._request(
                 "POST",
                 f"/api/v2/spa/vehicles/{vehicle_id}/"
@@ -386,7 +395,7 @@ class JapanCommandsMixin:
         ):
             raise ValueError("No Japan schedule changes requested")
         vehicle_id = self._command_vehicle_id(vehicle)
-        headers = self._control_headers(token)
+        headers = self._control_headers(token, vehicle)
         current = self._payload(
             self._request(
                 "GET",
@@ -759,7 +768,7 @@ class JapanCommandsMixin:
         self._request(
             "POST",
             f"/api/v1/spa/vehicles/{vehicle_id}/charge/target",
-            headers=self._headers(token),
+            headers=self._vehicle_headers(token, vehicle),
             json={
                 "targetSOClist": [
                     {"plugType": 0, "targetSOClevel": dc},

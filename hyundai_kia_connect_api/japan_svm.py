@@ -102,8 +102,13 @@ class JapanSVM:
             r"[A-Za-z0-9_-]+", vehicle.id
         ):
             raise InvalidAPIResponseError("Japan vehicle identifier is invalid")
+        # The app's camera flow validates its PIN grant before requesting an
+        # image, but SVMApi deliberately uses the ordinary OAuth authorization.
+        self._control_headers(token, vehicle)
         path = f"/api/v1/spa/vehicles/{vehicle.id}/svm/async"
-        result = self._request("POST", path, headers=self._headers(token))
+        result = self._request(
+            "POST", path, headers=self._vehicle_headers(token, vehicle)
+        )
         message_id = result.get("msgId")
         if not isinstance(message_id, str) or not message_id:
             raise InvalidAPIResponseError("Japan camera request identifier is missing")
@@ -113,7 +118,7 @@ class JapanSVM:
                 result = self._request(
                     "GET",
                     path,
-                    headers=self._headers(token),
+                    headers=self._vehicle_headers(token, vehicle),
                     params={"msgId": message_id},
                 )
             except NoDataFound:
