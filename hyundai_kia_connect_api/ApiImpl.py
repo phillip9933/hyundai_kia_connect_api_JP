@@ -436,9 +436,18 @@ class ApiImpl:
     # Existing adapters retain their behavior; read-only regions opt out.
     supports_remote_commands: bool = True
     supports_force_refresh: bool = True
+    # None preserves existing adapters; explicit sets list implemented methods.
+    supported_commands: frozenset[str] | None = None
+    requires_command_confirmation: bool = False
 
     def __init__(self) -> None:
         """Initialize."""
+
+    def initialize_vehicle_capabilities(self, vehicle: Vehicle) -> None:
+        """Apply regional capabilities; adapters may specialize by profile."""
+        vehicle.supports_window_control = self.supports_window_control
+        vehicle.supports_valet_mode = self.supports_valet_mode
+        vehicle.supports_svm = self.supports_svm
 
     def login(
         self,

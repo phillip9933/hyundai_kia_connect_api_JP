@@ -2,11 +2,12 @@
 
 import datetime as dt
 import logging
-from unittest.mock import Mock
+from unittest.mock import Mock, PropertyMock
 
 import pytest
 import requests
 
+from hyundai_kia_connect_api.const import ORDER_STATUS
 from hyundai_kia_connect_api.exceptions import (
     APIError,
     AuthenticationError,
@@ -14,7 +15,6 @@ from hyundai_kia_connect_api.exceptions import (
     InvalidAPIResponseError,
     RateLimitingError,
     RequestTimeoutError,
-    UnsupportedControlError,
 )
 from hyundai_kia_connect_api.HyundaiBlueLinkApiJP import HyundaiBlueLinkApiJP
 from hyundai_kia_connect_api.Token import Token
@@ -42,14 +42,9 @@ def api():
 def test_factory_and_capabilities():
     api = VehicleManager.get_implementation_by_region_brand(10, 2, "en")
     assert isinstance(api, HyundaiBlueLinkApiJP)
-    for capability in (
-        "supports_remote_commands",
-        "supports_force_refresh",
-        "supports_window_control",
-        "supports_valet_mode",
-        "supports_svm",
-    ):
-        assert getattr(api, capability) is False
+    assert api.supports_force_refresh is True
+    assert api.requires_command_confirmation is True
+    assert "schedule_charging_and_climate" in api.supported_commands
     for brand in (1, 3):
         with pytest.raises(APIError):
             VehicleManager.get_implementation_by_region_brand(10, brand, "en")
@@ -239,8 +234,7 @@ def test_legacy_cached_wrapper_single_request(api):
     assert vehicle.is_locked is True
     assert vehicle.car_battery_percentage == 80
     assert vehicle.last_updated_at.utcoffset() == dt.timedelta(hours=9)
-    api.session.request.assert_called_once()
-    assert api.session.request.call_args.args[1].endswith("/status/latest")
+    assert api.session.request.call_args_list[0].args[1].endswith("/status/latest")
 
 
 def test_ccs2_cached_single_request(api):
@@ -268,8 +262,9 @@ def test_ccs2_cached_single_request(api):
     assert vehicle.total_driving_range_unit == "km"
     assert vehicle.last_updated_at.hour == 18
     assert vehicle.last_updated_at.utcoffset() == dt.timedelta(hours=9)
-    api.session.request.assert_called_once()
-    assert api.session.request.call_args.args[1].endswith("/ccs2/carstatus/latest")
+    assert (
+        api.session.request.call_args_list[0].args[1].endswith("/ccs2/carstatus/latest")
+    )
 
 
 @pytest.mark.parametrize(
@@ -282,34 +277,6 @@ def test_malformed_status_rejected(api, payload):
     with pytest.raises(InvalidAPIResponseError):
         api.update_vehicle_with_cached_state(Token(), vehicle)
     assert vehicle.last_updated_at is None
-
-
-@pytest.mark.parametrize(
-    "method",
-    [
-        "force_refresh_vehicle_state",
-        "lock_action",
-        "start_climate",
-        "stop_climate",
-        "start_charge",
-        "stop_charge",
-        "set_charge_limits",
-        "set_charging_current",
-        "set_windows_state",
-        "charge_port_action",
-        "schedule_charging_and_climate",
-        "start_hazard_lights",
-        "start_hazard_lights_and_horn",
-        "valet_mode_action",
-        "set_vehicle_to_load_discharge_limit",
-        "set_navigation",
-        "request_svm_capture",
-    ],
-)
-def test_commands_fail_before_io(api, method):
-    with pytest.raises(UnsupportedControlError):
-        getattr(api, method)(Token(), Vehicle())
-    api.session.request.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -383,7 +350,7 @@ def test_legacy_temperature_does_not_guess_profile_dependent_scale(api):
                         "airTemp": {
                             "value": "0EH",
                             "unit": 0,
-                            "hvacTempType": 1,
+                            "hvacTempType": None,
                         },
                     },
                 }
@@ -510,3 +477,468 @@ def test_requests_json_decode_error_has_response_classification(api):
     with pytest.raises(InvalidAPIResponseError) as raised:
         api.get_vehicles(Token())
     assert "UNIQUE_SYNTHETIC_SECRET" not in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    "range_option,hvac_type,code,expected",
+    [
+        (0, 1, "06H", 17.0),
+        (0, 1, "1AH", 27.0),
+        (1, 1, "03H", 15.5),
+        (1, 1, "1FH", 29.5),
+        (None, 4, "02H", 15.0),
+        (None, 4, "20H", 30.0),
+        (0, 1, "00H", None),
+        (0, 1, "FEH", None),
+        (None, None, "06H", None),
+        (0, 1, "secret", None),
+    ],
+)
+def test_profile_dependent_legacy_temperature(
+    api, range_option, hvac_type, code, expected
+):
+    api._vehicle_profiles["synthetic"] = {
+        "option": {"climateTempRangeOption": range_option}
+    }
+    assert (
+        api._legacy_temperature(
+            Vehicle(id="synthetic"),
+            {
+                "value": code,
+                "unit": 0,
+                "hvacTempType": hvac_type,
+            },
+        )
+        == expected
+    )
+
+
+@pytest.mark.parametrize("wrapped", [True, False])
+def test_stored_location_including_zero_coordinates(api, wrapped):
+    payload = {"coord": {"lat": 0, "lon": 0}, "time": "20261014090000"}
+    api.session.request.return_value = response(
+        envelope({"gpsDetail": payload} if wrapped else payload)
+    )
+    vehicle = Vehicle(id="synthetic")
+    api.update_vehicle_with_cached_location(Token(), vehicle)
+    assert vehicle.location_latitude == 0
+    assert vehicle.location_longitude == 0
+    assert vehicle.location_last_updated_at.utcoffset() == dt.timedelta(hours=9)
+    assert api.session.request.call_args.args[1].endswith("/location/park")
+
+
+@pytest.mark.parametrize(
+    "latitude,longitude", [(91, 0), (0, 181), (float("nan"), 0), (True, 0)]
+)
+def test_invalid_parking_coordinates_do_not_mutate_vehicle(api, latitude, longitude):
+    api.session.request.return_value = response(
+        envelope(
+            {"coord": {"lat": latitude, "lon": longitude}, "time": "20261014090000"}
+        )
+    )
+    vehicle = Vehicle(id="synthetic")
+    with pytest.raises(InvalidAPIResponseError):
+        api.update_vehicle_with_cached_location(Token(), vehicle)
+    assert vehicle.location_latitude is None
+
+
+def test_stored_energy_totals_preserve_zero(api):
+    api.session.request.return_value = response(
+        envelope(
+            {
+                "drivingInfo": [
+                    {
+                        "drivingPeriod": 0,
+                        "totalPwrCsp": 0,
+                        "regenPwr": 123.5,
+                    }
+                ]
+            }
+        )
+    )
+    vehicle = Vehicle(id="synthetic")
+    api.update_vehicle_with_driving_info(Token(), vehicle)
+    assert vehicle.total_power_consumed == 0
+    assert vehicle.total_power_regenerated == 123.5
+    assert api.session.request.call_args.kwargs["json"] == {"periodTarget": 0}
+
+
+def test_invalid_energy_totals_do_not_mutate_vehicle(api):
+    api.session.request.return_value = response(
+        envelope(
+            {
+                "drivingInfo": [
+                    {
+                        "drivingPeriod": 0,
+                        "totalPwrCsp": 1,
+                        "regenPwr": -1,
+                    }
+                ]
+            }
+        )
+    )
+    vehicle = Vehicle(id="synthetic")
+    with pytest.raises(InvalidAPIResponseError):
+        api.update_vehicle_with_driving_info(Token(), vehicle)
+    assert vehicle.total_power_consumed is None
+
+
+def test_profile_camera_capability_survives_vehicle_manager_initialization(
+    api, monkeypatch
+):
+    api._vehicle_profiles["supported"] = {"option": {"svmOptionInfo": 1}}
+    api._vehicle_profiles["unsupported"] = {"option": {"svmOptionInfo": 0}}
+    vehicles = [Vehicle(id="supported"), Vehicle(id="unsupported")]
+    monkeypatch.setattr(api, "get_vehicles", lambda token: vehicles)
+    monkeypatch.setattr(
+        VehicleManager, "get_implementation_by_region_brand", lambda *args: api
+    )
+    manager = VehicleManager(
+        10, 2, "synthetic", "synthetic", "1234", geocode_api_enable=False
+    )
+    manager.initialize_vehicles()
+    assert manager.vehicles["supported"].supports_svm is True
+    assert manager.vehicles["unsupported"].supports_svm is False
+
+
+def test_optional_auth_failure_does_not_publish_partial_status(api):
+    api.session.request.side_effect = [
+        response(
+            envelope(
+                {
+                    "vehicleStatusInfo": {
+                        "vehicleStatus": {
+                            "time": "20261014090000",
+                            "doorLock": True,
+                        }
+                    }
+                }
+            )
+        ),
+        response({}, 401),
+    ]
+    vehicle = Vehicle(id="synthetic", ccu_ccs2_protocol_support=0)
+    with pytest.raises(AuthenticationError):
+        api.update_vehicle_with_cached_state(Token(), vehicle)
+    assert vehicle.is_locked is None
+    assert vehicle.last_updated_at is None
+
+
+def test_missing_parking_data_is_not_requested_each_poll(api):
+    api.session.request.return_value = response(
+        envelope(
+            {
+                "vehicleStatusInfo": {
+                    "vehicleStatus": {"time": "20261014090000"},
+                }
+            }
+        )
+    )
+    vehicle = Vehicle(id="synthetic", ccu_ccs2_protocol_support=0)
+    api.update_vehicle_with_cached_state(Token(), vehicle)
+    api.update_vehicle_with_cached_state(Token(), vehicle)
+    assert (
+        sum(
+            call.args[1].endswith("/location/park")
+            for call in api.session.request.call_args_list
+        )
+        == 1
+    )
+
+
+def test_mqtt_registration_uuid_token_roundtrip_and_refresh(api):
+    token = Token(
+        refresh_token="refresh", mqtt_registration_uuid="synthetic-registration"
+    )
+    restored = Token.from_dict(token.to_dict())
+    assert restored.mqtt_registration_uuid == "synthetic-registration"
+    api.session.request.return_value = response(
+        {"token_type": "Bearer", "access_token": "access", "expires_in": 600}
+    )
+    assert (
+        api.refresh_access_token(restored).mqtt_registration_uuid
+        == "synthetic-registration"
+    )
+
+
+def test_force_refresh_requires_correlated_completion_and_newer_state(api, monkeypatch):
+    helper = Mock()
+    helper.status.return_value = ORDER_STATUS.SUCCESS
+    helper.latest_state = {
+        "Date": dt.datetime.now(dt.UTC).strftime("%Y%m%d%H%M%S"),
+        "Drivetrain": {"FuelSystem": {"DTE": {"Total": 321, "Unit": 1}}},
+        "Green": {"BatteryManagement": {"BatteryRemain": {"Ratio": 70}}},
+    }
+    monkeypatch.setattr(api, "_mqtt_for_vehicle", lambda *args: helper)
+    monkeypatch.setattr(
+        api, "_control_headers", lambda token: {"Authorization": "synthetic"}
+    )
+    api.session.request.return_value = response({"msgId": "synthetic-action"})
+    vehicle = Vehicle(id="synthetic", ccu_ccs2_protocol_support=1)
+    vehicle.last_updated_at = dt.datetime(2026, 10, 13, tzinfo=dt.UTC)
+    api.force_refresh_vehicle_state(Token(pin="1234"), vehicle)
+    helper.prepare.assert_called_once()
+    helper.track.assert_called_once_with("synthetic-action")
+    assert vehicle.ev_battery_percentage == 70
+    assert vehicle.total_driving_range == 321
+    assert api.session.request.call_args.args[1].endswith("/ccs2/carstatus")
+
+
+@pytest.mark.parametrize(
+    "status,error",
+    [(ORDER_STATUS.UNKNOWN, RequestTimeoutError), (ORDER_STATUS.FAILED, APIError)],
+)
+def test_force_refresh_ack_does_not_mean_success(api, monkeypatch, status, error):
+    helper = Mock()
+    helper.status.return_value = status
+    monkeypatch.setattr(api, "_mqtt_for_vehicle", lambda *args: helper)
+    monkeypatch.setattr(api, "_control_headers", lambda token: {})
+    api.session.request.return_value = response({"msgId": "synthetic-action"})
+    vehicle = Vehicle(id="synthetic", ccu_ccs2_protocol_support=1)
+    with pytest.raises(error):
+        api.force_refresh_vehicle_state(Token(pin="1234"), vehicle)
+    assert vehicle.last_updated_at is None
+
+
+def test_confirmed_refresh_without_new_telemetry_times_out(api, monkeypatch):
+    helper = Mock()
+    helper.status.return_value = ORDER_STATUS.SUCCESS
+    helper.latest_state = None
+    monkeypatch.setattr(api, "_mqtt_for_vehicle", lambda *args: helper)
+    monkeypatch.setattr(api, "_control_headers", lambda token: {})
+    monkeypatch.setattr(api, "update_vehicle_with_cached_state", lambda *args: None)
+    api.FORCE_REFRESH_TIMEOUT = 0.001
+    api.session.request.return_value = response({"msgId": "synthetic-action"})
+    vehicle = Vehicle(id="synthetic", ccu_ccs2_protocol_support=1)
+    with pytest.raises(RequestTimeoutError):
+        api.force_refresh_vehicle_state(Token(pin="1234"), vehicle)
+    assert vehicle.last_updated_at is None
+
+
+def test_force_ignores_retained_state_and_uses_newer_cached_status(api, monkeypatch):
+    helper = Mock()
+    helper.status.return_value = ORDER_STATUS.SUCCESS
+    helper.latest_state = {"Date": "20261013090000"}
+    monkeypatch.setattr(api, "_mqtt_for_vehicle", lambda *args: helper)
+    monkeypatch.setattr(api, "_control_headers", lambda token: {})
+
+    def cached(token, candidate):
+        candidate.last_updated_at = dt.datetime.now(dt.UTC)
+        candidate.is_locked = True
+
+    monkeypatch.setattr(api, "update_vehicle_with_cached_state", cached)
+    api.session.request.return_value = response({"msgId": "synthetic-action"})
+    vehicle = Vehicle(id="synthetic", ccu_ccs2_protocol_support=1)
+    vehicle.last_updated_at = dt.datetime(2026, 10, 13, 10, tzinfo=dt.UTC)
+    api.force_refresh_vehicle_state(Token(pin="1234"), vehicle)
+    assert vehicle.last_updated_at > dt.datetime(2026, 10, 13, tzinfo=dt.UTC)
+    assert vehicle.is_locked is True
+
+
+def test_force_completion_before_vss_waits_for_newer_message(api, monkeypatch):
+    helper = Mock()
+    helper.status.return_value = ORDER_STATUS.SUCCESS
+    new_state = {
+        "Date": dt.datetime.now(dt.UTC).strftime("%Y%m%d%H%M%S"),
+        "Drivetrain": {"FuelSystem": {"DTE": {"Total": 321, "Unit": 1}}},
+    }
+    monkeypatch.setattr(
+        type(helper),
+        "latest_state",
+        PropertyMock(side_effect=[None, new_state]),
+        raising=False,
+    )
+    monkeypatch.setattr(api, "_mqtt_for_vehicle", lambda *args: helper)
+    monkeypatch.setattr(api, "_control_headers", lambda token: {})
+    monkeypatch.setattr(api, "update_vehicle_with_cached_state", lambda *args: None)
+    monkeypatch.setattr("time.sleep", lambda *args: None)
+    api.session.request.return_value = response({"msgId": "synthetic-action"})
+    vehicle = Vehicle(id="synthetic", ccu_ccs2_protocol_support=1)
+    vehicle.last_updated_at = dt.datetime(2026, 10, 13, tzinfo=dt.UTC)
+    api.force_refresh_vehicle_state(Token(pin="1234"), vehicle)
+    assert vehicle.last_updated_at > dt.datetime(2026, 10, 13, tzinfo=dt.UTC)
+    assert vehicle.total_driving_range == 321
+
+
+def test_charge_target_mapping_and_cache(api):
+    api.session.request.return_value = response(
+        envelope(
+            {
+                "targetSOClist": [
+                    {"plugType": 0, "targetSOClevel": 80},
+                    {"plugType": 1, "targetSOClevel": 90},
+                ]
+            }
+        )
+    )
+    vehicle = Vehicle(id="synthetic")
+    api.update_vehicle_with_charge_targets(Token(), vehicle)
+    assert vehicle.ev_charge_limits_dc == 80
+    assert vehicle.ev_charge_limits_ac == 90
+    assert api._charge_target_cache[vehicle.id][1] == {0: 80, 1: 90}
+    assert api.session.request.call_args.args[1].endswith("/charge/target")
+
+
+@pytest.mark.parametrize(
+    "entries",
+    [
+        [{"plugType": True, "targetSOClevel": 90}],
+        [{"plugType": 0, "targetSOClevel": 101}],
+        [{"plugType": 0, "targetSOClevel": 80}, {"plugType": 0, "targetSOClevel": 90}],
+    ],
+)
+def test_invalid_charge_targets_are_transactional(api, entries):
+    api.session.request.return_value = response(envelope({"targetSOClist": entries}))
+    vehicle = Vehicle(id="synthetic", ev_charge_limits_dc=70)
+    with pytest.raises(InvalidAPIResponseError):
+        api.update_vehicle_with_charge_targets(Token(), vehicle)
+    assert vehicle.ev_charge_limits_dc == 70
+    assert vehicle.id not in api._charge_target_cache
+
+
+def test_charge_targets_preserve_alternate_ac_plug_type(api):
+    api.session.request.return_value = response(
+        envelope(
+            {
+                "targetSOClist": [
+                    {"plugType": 0, "targetSOClevel": 80},
+                    {"plugType": 2, "targetSOClevel": 90},
+                ]
+            }
+        )
+    )
+    vehicle = Vehicle(id="synthetic")
+    api.update_vehicle_with_charge_targets(Token(), vehicle)
+    assert vehicle.ev_charge_limits_ac == 90
+    assert api._charge_target_cache[vehicle.id][1] == {0: 80, 2: 90}
+
+
+def test_rhd_ccs2_physical_positions_only_front_fields_swap(api):
+    api._vehicle_profiles["synthetic"] = {"option": {"drvSeatLoc": "R"}}
+    vehicle = Vehicle(id="synthetic")
+    api._update_vehicle_properties_ccs2(
+        vehicle,
+        {
+            "Date": "20261014090000",
+            "Drivetrain": {"FuelSystem": {"DTE": {"Total": 300, "Unit": 1}}},
+            "Cabin": {
+                "Seat": {
+                    "Row1": {
+                        "Driver": {"Climate": {"State": 6}},
+                        "Passenger": {"Climate": {"State": 3}},
+                    },
+                    "Row2": {
+                        "Left": {"Climate": {"State": 7}},
+                        "Right": {"Climate": {"State": 4}},
+                    },
+                },
+                "Door": {
+                    "Row1": {
+                        "Driver": {"Open": True, "Lock": 0},
+                        "Passenger": {"Open": False, "Lock": 1},
+                    },
+                    "Row2": {"Left": {"Open": True}, "Right": {"Open": False}},
+                },
+                "Window": {"Row1": {"Driver": {"Open": 1}, "Passenger": {"Open": 0}}},
+            },
+        },
+    )
+    assert vehicle.front_right_seat_status == "Low Heat"
+    assert vehicle.front_left_seat_status == "Low Cool"
+    assert vehicle.rear_left_seat_status == "Medium Heat"
+    assert vehicle.rear_right_seat_status == "Medium Cool"
+    assert vehicle.front_right_door_is_open is True
+    assert vehicle.front_left_door_is_open is False
+    assert vehicle.front_right_door_is_locked is True
+    assert vehicle.front_left_door_is_locked is False
+    assert vehicle.back_left_door_is_open is True
+    assert vehicle.back_right_door_is_open is False
+    assert vehicle.front_right_window_is_open is True
+    assert vehicle.front_left_window_is_open is False
+
+
+def test_rhd_legacy_driver_seat_fallback(api):
+    api._vehicle_profiles["synthetic"] = {"option": {"drvSeatLoc": "R"}}
+    api.session.request.return_value = response(
+        envelope(
+            {
+                "vehicleStatusInfo": {
+                    "vehicleStatus": {
+                        "time": "20261014090000",
+                        "seatHeaterVentState": {
+                            "drvSeatHeatState": 6,
+                            "astSeatHeatState": 3,
+                        },
+                    }
+                }
+            }
+        )
+    )
+    vehicle = Vehicle(id="synthetic", ccu_ccs2_protocol_support=0)
+    api.update_vehicle_with_cached_state(Token(), vehicle)
+    assert vehicle.front_right_seat_status == "Low Heat"
+    assert vehicle.front_left_seat_status == "Low Cool"
+
+
+def test_daily_energy_rows_use_japan_calendar_dates_and_wh(api):
+    api.session.request.return_value = response(
+        envelope(
+            {
+                "drivingInfo": [
+                    {"drivingPeriod": 0, "totalPwrCsp": 1000, "regenPwr": 100}
+                ],
+                "drivingInfoDetail": [
+                    {
+                        "drivingDate": "20261014",
+                        "totalPwrCsp": 0,
+                        "motorPwrCsp": 0,
+                        "regenPwr": 50,
+                        "calculativeOdo": 10,
+                    }
+                ],
+            }
+        )
+    )
+    vehicle = Vehicle(id="synthetic")
+    api.update_vehicle_with_driving_info(Token(), vehicle)
+    assert len(vehicle.daily_stats) == 1
+    day = vehicle.daily_stats[0]
+    assert day.date.utcoffset() == dt.timedelta(hours=9)
+    assert day.total_consumed == 0
+    assert day.regenerated_energy == 50
+    assert day.distance == 10 and day.distance_unit == "km"
+    assert vehicle.power_consumption_30d is None
+
+
+@pytest.mark.parametrize(
+    "option,expected",
+    [
+        ({"climateTempRangeOption": 0}, (17.0, 27.0)),
+        ({"climateTempRangeOption": 1}, (15.5, 29.5)),
+        ({"hvacTempType": 4}, (15.0, 30.0)),
+        ({"climateTempRangeOption": True}, None),
+        ({}, None),
+    ],
+)
+def test_profile_climate_bounds_for_home_assistant(api, option, expected):
+    api._vehicle_profiles["synthetic"] = {"option": option}
+    vehicle = Vehicle(id="synthetic")
+    api.initialize_vehicle_capabilities(vehicle)
+    assert vehicle.climate_temperature_range == expected
+
+
+def test_front_only_window_capability_preserves_rear_telemetry(api):
+    api._vehicle_profiles["synthetic"] = {
+        "option": {"windowSafetyOption2": 4},
+        "serviceOption": {"windowControlOption": 1},
+    }
+    vehicle = Vehicle(id="synthetic", back_left_window_is_open=True)
+    api.initialize_vehicle_capabilities(vehicle)
+    assert vehicle.supported_window_positions == ("front_left", "front_right")
+    assert vehicle.back_left_window_is_open is True
+
+
+def test_old_cached_only_token_requires_reauthentication_without_io(api):
+    with pytest.raises(AuthenticationError, match="Reauthenticate"):
+        api._mqtt_for_vehicle(Token(), Vehicle(id="synthetic"))
+    api.session.request.assert_not_called()
