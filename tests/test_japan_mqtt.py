@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
+from requests.structures import CaseInsensitiveDict
 
 from hyundai_kia_connect_api.const import ORDER_STATUS
 from hyundai_kia_connect_api.exceptions import (
@@ -37,8 +38,8 @@ class FakeClient:
         return 0
 
 
-def response(payload, status=200):
-    result = Mock(status_code=status)
+def response(payload, status=200, headers=None):
+    result = Mock(status_code=status, headers=CaseInsensitiveDict(headers or {}))
     result.json.return_value = payload
     return result
 
@@ -351,3 +352,89 @@ def test_requests_json_decode_error_has_typed_safe_response(session):
         instance.prepare()
     assert "synthetic-secret" not in str(caught.value)
     assert instance._client is None
+
+
+@pytest.mark.parametrize("header_name", ["tid", "Tid", "TID"])
+def test_host_transaction_identity_comes_from_http_header(session, header_name):
+    instance, _client = session
+    replies = list(instance._http_session.request.side_effect)
+    payload = replies[0].json.return_value.copy()
+    payload.pop("tid")
+    replies[0] = response(payload, headers={header_name: "synthetic-header-tid"})
+    instance._http_session.request.side_effect = replies
+    instance.prepare()
+    calls = instance._http_session.request.call_args_list
+    assert all(
+        call.kwargs["headers"]["tid"] == "synthetic-header-tid" for call in calls[1:]
+    )
+    assert "tid" not in payload
+
+
+def test_header_transaction_identity_takes_precedence_over_body(session):
+    instance, _client = session
+    replies = list(instance._http_session.request.side_effect)
+    replies[0].headers["tid"] = "synthetic-header-tid"
+    instance._http_session.request.side_effect = replies
+    instance.prepare()
+    assert (
+        instance._http_session.request.call_args_list[1].kwargs["headers"]["tid"]
+        == "synthetic-header-tid"
+    )
+
+
+@pytest.mark.parametrize(
+    "tid", ["", "   ", "synthetic\r\ninvalid", "synthetic\x00invalid"]
+)
+def test_invalid_header_transaction_identity_fails_before_registration(session, tid):
+    instance, _client = session
+    replies = list(instance._http_session.request.side_effect)
+    replies[0].headers["tid"] = tid
+    instance._http_session.request.side_effect = replies
+    with pytest.raises(
+        InvalidAPIResponseError, match="transaction identity is missing"
+    ):
+        instance.prepare()
+    assert instance._http_session.request.call_count == 1
+
+
+def test_missing_host_transaction_identity_fails_before_registration(session):
+    instance, _client = session
+    replies = list(instance._http_session.request.side_effect)
+    replies[0].json.return_value.pop("tid")
+    instance._http_session.request.side_effect = replies
+    with pytest.raises(
+        InvalidAPIResponseError, match="transaction identity is missing"
+    ):
+        instance.prepare()
+    assert instance._http_session.request.call_count == 1
+
+
+def test_request_context_is_empty_before_prepare(session):
+    instance, _client = session
+    assert instance.request_context == {}
+
+
+def test_request_context_uses_validated_broker_identity_and_is_copied(session):
+    instance, _client = session
+    replies = list(instance._http_session.request.side_effect)
+    replies[2] = response(
+        {"vehicles": [{"unit": "ccu", "vehicleId": "synthetic-broker-vehicle"}]}
+    )
+    instance._http_session.request.side_effect = replies
+    instance.prepare()
+    expected = {"clientId": "synthetic-client", "vehicleId": "synthetic-broker-vehicle"}
+    assert instance.request_context == expected
+    context = instance.request_context
+    context["vehicleId"] = "changed-copy"
+    assert instance.request_context == expected
+    instance.close()
+    assert instance.request_context == expected
+    assert instance.closed
+
+
+def test_failed_subscription_does_not_expose_request_context(session):
+    instance, client = session
+    client.grant = [128, 1, 1]
+    with pytest.raises(APIError):
+        instance.prepare()
+    assert instance.request_context == {}

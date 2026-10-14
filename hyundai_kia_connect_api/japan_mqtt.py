@@ -76,6 +76,8 @@ class JapanMqttSession:
         self._tracked = set()
         self._latest_state = None
         self._topics = ()
+        self._pending_context = {}
+        self._request_context = {}
 
     def _http(
         self, method: str, path: str, *, headers=None, allow_not_found=False, **kwargs
@@ -114,6 +116,12 @@ class JapanMqttSession:
             raise InvalidAPIResponseError(
                 "Japan MQTT bootstrap returned an invalid object"
             )
+        if path == "/api/v3/servicehub/device/host":
+            # The app copies the transaction ID from the HTTP header into
+            # MQTTHostResponse; it is not necessarily present in the JSON body.
+            header_tid = response.headers.get("tid")
+            if header_tid is not None:
+                result = {**result, "tid": header_tid}
         return result
 
     @classmethod
@@ -179,7 +187,12 @@ class JapanMqttSession:
             host_info = self._http("GET", "/api/v3/servicehub/device/host")
             host, port = self._broker(host_info)
             tid = host_info.get("tid")
-            if not isinstance(tid, str) or not tid or "\r" in tid or "\n" in tid:
+            if (
+                not isinstance(tid, str)
+                or not tid.strip()
+                or len(tid) > 1024
+                or any(ord(character) < 32 or ord(character) > 126 for character in tid)
+            ):
                 raise InvalidAPIResponseError(
                     "Japan MQTT transaction identity is missing"
                 )
@@ -236,6 +249,10 @@ class JapanMqttSession:
                 self.TOPIC_PREFIX + "res/" + client_id,
                 self.TOPIC_PREFIX + "connection/" + broker_vehicle_id,
             )
+            self._pending_context = {
+                "clientId": client_id,
+                "vehicleId": broker_vehicle_id,
+            }
             client = mqtt.Client(
                 mqtt.CallbackAPIVersion.VERSION2,
                 client_id=client_id,
@@ -316,6 +333,7 @@ class JapanMqttSession:
             self._fail("Japan MQTT subscriptions were not granted QoS 1")
             return
         with self._condition:
+            self._request_context = dict(self._pending_context)
             self._ready = True
             self._condition.notify_all()
 
@@ -400,6 +418,17 @@ class JapanMqttSession:
             return self._results[action_id] if ready else ORDER_STATUS.TIMEOUT
 
     @property
+    def request_context(self) -> dict[str, str]:
+        """Copy validated API header identities after successful subscription.
+
+        The app retains these identities beyond broker disconnection. Keeping
+        them after close supports subsequent stored-image requests without
+        retaining any MQTT authentication material in the returned mapping.
+        """
+        with self._condition:
+            return dict(self._request_context)
+
+    @property
     def closed(self) -> bool:
         """Whether the caller must create a replacement session."""
         with self._condition:
@@ -419,6 +448,7 @@ class JapanMqttSession:
             self._results.clear()
             self._tracked.clear()
             self._latest_state = None
+            self._pending_context.clear()
             self._condition.notify_all()
         client, self._client = self._client, None
         if client is not None:
