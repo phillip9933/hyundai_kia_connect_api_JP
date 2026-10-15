@@ -11,6 +11,7 @@ from requests.structures import CaseInsensitiveDict
 from hyundai_kia_connect_api.const import ORDER_STATUS
 from hyundai_kia_connect_api.exceptions import (
     APIError,
+    AuthenticationError,
     InvalidAPIResponseError,
     RequestTimeoutError,
 )
@@ -438,3 +439,65 @@ def test_failed_subscription_does_not_expose_request_context(session):
     with pytest.raises(APIError):
         instance.prepare()
     assert instance.request_context == {}
+
+
+@pytest.mark.parametrize("status", [200, 201, 204])
+def test_protocol_registration_does_not_require_json_body(session, status):
+    instance, client = session
+    replies = list(instance._http_session.request.side_effect)
+    acknowledgement = response(None, status)
+    acknowledgement.json.side_effect = ValueError("synthetic-private-response")
+    replies[3] = acknowledgement
+    instance._http_session.request.side_effect = replies
+
+    instance.prepare()
+
+    acknowledgement.json.assert_not_called()
+    client.connect_async.assert_called_once()
+    assert instance.request_context == {
+        "clientId": "synthetic-client",
+        "vehicleId": "synthetic-vehicle",
+    }
+
+
+@pytest.mark.parametrize("status", [302, 400, 401, 403, 429, 500])
+def test_protocol_acknowledgement_must_still_have_success_http_status(session, status):
+    instance, client = session
+    replies = list(instance._http_session.request.side_effect)
+    acknowledgement = response(None, status)
+    replies[3] = acknowledgement
+    instance._http_session.request.side_effect = replies
+
+    with pytest.raises(AuthenticationError if status in (401, 403) else APIError):
+        instance.prepare()
+
+    acknowledgement.json.assert_not_called()
+    client.connect_async.assert_not_called()
+    assert instance.request_context == {}
+
+
+@pytest.mark.parametrize(
+    "method,path,stage",
+    [
+        ("GET", "/api/v3/servicehub/device/host", "host discovery"),
+        ("POST", "/api/v3/servicehub/device/register", "client registration"),
+        ("GET", "/api/v3/servicehub/vehicles/metadatalist", "vehicle metadata"),
+        ("POST", "/api/v3/servicehub/vehicleId", "vehicle registration"),
+    ],
+)
+def test_required_json_body_is_strict_with_safe_stage_diagnostics(
+    session, method, path, stage
+):
+    instance, client = session
+    invalid = response(None, 200)
+    invalid.json.side_effect = ValueError("synthetic-private-response")
+    instance._http_session.request.side_effect = [invalid]
+
+    with pytest.raises(InvalidAPIResponseError) as caught:
+        instance._http(method, path)
+
+    assert str(caught.value) == (
+        f"Japan MQTT bootstrap returned invalid JSON ({stage}; HTTP 200)"
+    )
+    assert "synthetic-private-response" not in str(caught.value)
+    client.connect_async.assert_not_called()

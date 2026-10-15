@@ -82,6 +82,13 @@ class JapanMqttSession:
     def _http(
         self, method: str, path: str, *, headers=None, allow_not_found=False, **kwargs
     ):
+        stage = {
+            "/api/v3/servicehub/device/host": "host discovery",
+            "/api/v3/servicehub/device/register": "client registration",
+            "/api/v3/servicehub/vehicles/metadatalist": "vehicle metadata",
+            "/api/v3/servicehub/vehicleId": "vehicle registration",
+            "/api/v3/servicehub/device/protocol": "protocol registration",
+        }.get(path, "bootstrap")
         request_headers = self._headers_factory()
         if headers:
             request_headers.update(headers)
@@ -103,18 +110,26 @@ class JapanMqttSession:
                 raise ServiceTemporaryUnavailable("Japan MQTT service is unavailable")
             if not 200 <= response.status_code < 300:
                 raise APIError("Japan MQTT bootstrap request failed")
+            # The app maps this response to an empty acknowledgement object
+            # without parsing ResponseBody (widget/b.java, case 21). A 204 or
+            # empty/text 200 is valid here; discovery/identity responses still
+            # require JSON and validated fields before MQTT can connect.
+            if method == "POST" and path == "/api/v3/servicehub/device/protocol":
+                return {}
             result = response.json()
         except (requests.exceptions.Timeout, RequestTimeoutError):
             raise RequestTimeoutError("Japan MQTT bootstrap timed out") from None
         except ValueError:
             raise InvalidAPIResponseError(
-                "Japan MQTT bootstrap returned invalid JSON"
+                f"Japan MQTT bootstrap returned invalid JSON "
+                f"({stage}; HTTP {response.status_code})"
             ) from None
         except requests.exceptions.RequestException:
             raise APIError("Japan MQTT bootstrap connection failed") from None
         if not isinstance(result, dict):
             raise InvalidAPIResponseError(
-                "Japan MQTT bootstrap returned an invalid object"
+                f"Japan MQTT bootstrap returned an invalid object "
+                f"({stage}; HTTP {response.status_code})"
             )
         if path == "/api/v3/servicehub/device/host":
             # The app copies the transaction ID from the HTTP header into
