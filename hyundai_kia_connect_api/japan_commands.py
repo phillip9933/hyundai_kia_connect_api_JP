@@ -26,7 +26,12 @@ from .exceptions import (
 
 
 class JapanCommandsMixin:
-    """Vehicle commands and stored charge settings for the Japan adapter."""
+    """Vehicle commands and stored charge settings for the Japan adapter.
+
+    Wire commands are RemoteRepository$Command.command values, not enum names.
+    The app constructor must be checked in bytecode: Java decompilation can
+    silently omit its Object command argument and display misleading names.
+    """
 
     @staticmethod
     def _japan_capability(value):
@@ -227,22 +232,22 @@ class JapanCommandsMixin:
     def lock_action(self, token, vehicle, action):
         if action not in (VEHICLE_LOCK_ACTION.LOCK, VEHICLE_LOCK_ACTION.UNLOCK):
             raise ValueError("Unsupported Japan door action")
-        command = "DOOR_LOCK" if action == VEHICLE_LOCK_ACTION.LOCK else "DOOR_UNLOCK"
+        command = action.value
         return self._japan_command(token, vehicle, "control/door", {"command": command})
 
     def start_charge(self, token, vehicle):
         return self._japan_command(
-            token, vehicle, "control/charge", {"command": "CHARGE_START"}
+            token, vehicle, "control/charge", {"command": "start"}
         )
 
     def stop_charge(self, token, vehicle):
         return self._japan_command(
-            token, vehicle, "control/charge", {"command": "CHARGE_STOP"}
+            token, vehicle, "control/charge", {"command": "stop"}
         )
 
     def stop_climate(self, token, vehicle):
         return self._japan_command(
-            token, vehicle, "control/temperature", {"command": "EV_ENGINE_STOP"}
+            token, vehicle, "control/temperature", {"command": "stop"}
         )
 
     def charge_port_action(self, token, vehicle, action):
@@ -254,9 +259,7 @@ class JapanCommandsMixin:
             raise UnsupportedControlError("Japan charge port capability is absent")
         if action not in (CHARGE_PORT_ACTION.OPEN, CHARGE_PORT_ACTION.CLOSE):
             raise ValueError("Japan charge port action is invalid")
-        command = (
-            "PORT_DOOR_OPEN" if action == CHARGE_PORT_ACTION.OPEN else "PORT_DOOR_CLOSE"
-        )
+        command = action.value
         return self._japan_command(
             token, vehicle, "control/portdoor", {"command": command}
         )
@@ -266,9 +269,7 @@ class JapanCommandsMixin:
             self._japan_profile_section(vehicle, "option").get("lightOnlyAvailable")
         ):
             raise UnsupportedControlError("Japan light control capability is absent")
-        return self._japan_command(
-            token, vehicle, "control/light", {"command": "LIGHT"}
-        )
+        return self._japan_command(token, vehicle, "control/light", {"command": "on"})
 
     def start_hazard_lights_and_horn(self, token, vehicle):
         if not self._japan_capability(
@@ -278,7 +279,7 @@ class JapanCommandsMixin:
         option = self._japan_profile_section(vehicle, "serviceOption").get(
             "remoteLightControlOption"
         )
-        command = "HORN_LAMP" if option == 0 else "HORN_LIGHT"
+        command = "lowbeam" if option == 0 else "on"
         return self._japan_command(
             token, vehicle, "control/hornlight", {"command": command}
         )
@@ -347,9 +348,7 @@ class JapanCommandsMixin:
             and not any(value is not None for value in curtains)
             and values[0] != WINDOW_STATE.VENTILATION
         ):
-            command = (
-                "WINDOW_OPEN" if values[0] == WINDOW_STATE.OPEN else "WINDOW_CLOSE"
-            )
+            command = "open" if values[0] == WINDOW_STATE.OPEN else "close"
             return self._japan_command(
                 token, vehicle, "control/window", {"command": command}
             )

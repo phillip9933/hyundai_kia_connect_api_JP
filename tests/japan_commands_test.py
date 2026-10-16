@@ -1,7 +1,12 @@
-"""Offline Japan command envelopes and truthful completion semantics."""
+"""Offline Japan command envelopes and truthful completion semantics.
+
+Wire literals were verified against raw constructor instructions in Japan app
+1.0.17 RemoteRepository$Command, independently of Java enum reconstruction.
+"""
 
 import copy
 import json
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -76,11 +81,11 @@ def setup():
 @pytest.mark.parametrize(
     "method,args,endpoint,command",
     [
-        ("lock_action", (VEHICLE_LOCK_ACTION.LOCK,), "door", "DOOR_LOCK"),
-        ("lock_action", (VEHICLE_LOCK_ACTION.UNLOCK,), "door", "DOOR_UNLOCK"),
-        ("start_charge", (), "charge", "CHARGE_START"),
-        ("stop_charge", (), "charge", "CHARGE_STOP"),
-        ("stop_climate", (), "temperature", "EV_ENGINE_STOP"),
+        ("lock_action", (VEHICLE_LOCK_ACTION.LOCK,), "door", "close"),
+        ("lock_action", (VEHICLE_LOCK_ACTION.UNLOCK,), "door", "open"),
+        ("start_charge", (), "charge", "start"),
+        ("stop_charge", (), "charge", "stop"),
+        ("stop_climate", (), "temperature", "stop"),
     ],
 )
 def test_exact_command_payload_and_pin_headers(method, args, endpoint, command):
@@ -122,7 +127,7 @@ def test_command_context_is_attached_after_prepare_not_before():
     assert request.kwargs["headers"]["vehicleId"] == "synthetic-broker-vehicle"
     assert request.kwargs["headers"]["ccuCCS2ProtocolSupport"] == "1"
     assert request.kwargs["headers"]["Authorization"] == "Bearer synthetic-control"
-    assert request.kwargs["json"] == {"command": "DOOR_UNLOCK"}
+    assert request.kwargs["json"] == {"command": "open"}
     assert "tid" not in request.kwargs["json"]
 
 
@@ -268,9 +273,24 @@ def test_default_temperature_and_rhd_seat_capability_mapping():
             "charge_port_action",
             (CHARGE_PORT_ACTION.OPEN,),
             {"serviceOption": {"chargePortDoorOption": 1}},
-            "PORT_DOOR_OPEN",
+            "open",
         ),
-        ("start_hazard_lights", (), {"option": {"lightOnlyAvailable": 1}}, "LIGHT"),
+        (
+            "charge_port_action",
+            (CHARGE_PORT_ACTION.CLOSE,),
+            {"serviceOption": {"chargePortDoorOption": 1}},
+            "close",
+        ),
+        ("start_hazard_lights", (), {"option": {"lightOnlyAvailable": 1}}, "on"),
+        (
+            "start_hazard_lights_and_horn",
+            (),
+            {
+                "option": {"hornLightAvailable": 1},
+                "serviceOption": {"remoteLightControlOption": 1},
+            },
+            "on",
+        ),
         (
             "start_hazard_lights_and_horn",
             (),
@@ -278,7 +298,7 @@ def test_default_temperature_and_rhd_seat_capability_mapping():
                 "option": {"hornLightAvailable": 1},
                 "serviceOption": {"remoteLightControlOption": 0},
             },
-            "HORN_LAMP",
+            "lowbeam",
         ),
     ],
 )
@@ -325,7 +345,7 @@ def test_all_window_open_and_unproved_partial_rejection():
         back_right=WINDOW_STATE.OPEN,
     )
     api.set_windows_state(token, vehicle, options)
-    assert api._request.call_args.kwargs["json"] == {"command": "WINDOW_OPEN"}
+    assert api._request.call_args.kwargs["json"] == {"command": "open"}
     options.back_left = None
     api._request.reset_mock()
     with pytest.raises(UnsupportedControlError):
@@ -535,3 +555,76 @@ def test_ev5_flat_schedule_uses_root_app_mode_and_scope_specific_wire_contracts(
         climate.args[3]["reservedHVACInfo1"]["reservHVACSet"]["airTemp"]["value"]
         == "0CH"
     )
+
+
+@pytest.mark.parametrize(
+    "state,command", [(WINDOW_STATE.OPEN, "open"), (WINDOW_STATE.CLOSED, "close")]
+)
+def test_uniform_window_wire_values_are_not_enum_names(state, command):
+    api, token, vehicle = setup()
+    api._vehicle_profiles[vehicle.id]["serviceOption"] = {"windowControlOption": 1}
+    api.set_windows_state(
+        token,
+        vehicle,
+        WindowRequestOptions(
+            front_left=state, front_right=state, back_left=state, back_right=state
+        ),
+    )
+    request = api._request.call_args
+    assert request.args == (
+        "POST",
+        "/api/v2/spa/vehicles/synthetic-car/ccs2/control/window",
+    )
+    assert request.kwargs["json"] == {"command": command}
+
+
+def test_command_values_match_independent_dex_constructor_facts():
+    facts = json.loads(
+        (
+            Path(__file__).parent / "fixtures/jp_android_1_0_17_command_values.json"
+        ).read_text()
+    )["command_values"]
+    cases = [
+        ("DOOR_LOCK", "lock_action", (VEHICLE_LOCK_ACTION.LOCK,)),
+        ("DOOR_UNLOCK", "lock_action", (VEHICLE_LOCK_ACTION.UNLOCK,)),
+        ("PORT_DOOR_OPEN", "charge_port_action", (CHARGE_PORT_ACTION.OPEN,)),
+        ("PORT_DOOR_CLOSE", "charge_port_action", (CHARGE_PORT_ACTION.CLOSE,)),
+        ("CHARGE_START", "start_charge", ()),
+        ("CHARGE_STOP", "stop_charge", ()),
+        ("EV_ENGINE_STOP", "stop_climate", ()),
+        ("LIGHT", "start_hazard_lights", ()),
+    ]
+    for enum_name, method, args in cases:
+        api, token, vehicle = setup()
+        api._vehicle_profiles[vehicle.id].update(
+            {
+                "serviceOption": {"chargePortDoorOption": 1},
+                "option": {"lightOnlyAvailable": 1},
+            }
+        )
+        getattr(api, method)(token, vehicle, *args)
+        assert api._request.call_args.kwargs["json"] == {"command": facts[enum_name]}
+    for option, enum_name in [(0, "HORN_LAMP"), (1, "HORN_LIGHT")]:
+        api, token, vehicle = setup()
+        api._vehicle_profiles[vehicle.id].update(
+            {
+                "serviceOption": {"remoteLightControlOption": option},
+                "option": {"hornLightAvailable": 1},
+            }
+        )
+        api.start_hazard_lights_and_horn(token, vehicle)
+        assert api._request.call_args.kwargs["json"] == {"command": facts[enum_name]}
+    for state, enum_name in [
+        (WINDOW_STATE.OPEN, "WINDOW_OPEN"),
+        (WINDOW_STATE.CLOSED, "WINDOW_CLOSE"),
+    ]:
+        api, token, vehicle = setup()
+        api._vehicle_profiles[vehicle.id]["serviceOption"] = {"windowControlOption": 1}
+        api.set_windows_state(
+            token,
+            vehicle,
+            WindowRequestOptions(
+                front_left=state, front_right=state, back_left=state, back_right=state
+            ),
+        )
+        assert api._request.call_args.kwargs["json"] == {"command": facts[enum_name]}
