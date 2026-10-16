@@ -156,12 +156,41 @@ def test_ack_without_image_is_not_success(adapter):
 def test_timeout_and_rejection_do_not_repeat_capture(adapter, monkeypatch):
     monkeypatch.setattr(
         "hyundai_kia_connect_api.japan_svm.time.monotonic",
-        Mock(side_effect=[0, 0, 121, 121]),
+        Mock(side_effect=[0, 0, 146, 146]),
     )
     adapter._request.side_effect = [{"msgId": "SYNTHETIC_ID"}, NoDataFound("pending")]
     with pytest.raises(RequestTimeoutError):
         adapter.request_svm_capture(None, Vehicle(id="CAR", supports_svm=True), True)
     assert adapter._request.call_count == 2
+
+
+def test_slow_vehicle_upload_within_app_polling_window_is_displayable(
+    adapter, monkeypatch
+):
+    clock = [0]
+    monkeypatch.setattr(
+        "hyundai_kia_connect_api.japan_svm.time.monotonic", lambda: clock[0]
+    )
+
+    def sleep(seconds):
+        clock[0] += seconds
+
+    monkeypatch.setattr("hyundai_kia_connect_api.japan_svm.time.sleep", sleep)
+
+    def request(method, path, **kwargs):
+        if method == "POST":
+            return {"msgId": "SYNTHETIC_ID"}
+        assert kwargs["params"] == {"msgId": "SYNTHETIC_ID"}
+        if clock[0] < 130:
+            raise NoDataFound("pending")
+        return {"resMsg": payload()}
+
+    adapter._request.side_effect = request
+    vehicle = Vehicle(id="CAR", supports_svm=True)
+    details = adapter.request_svm_capture(None, vehicle, True)
+    assert clock[0] == 130
+    assert adapter.get_svm_details(None, vehicle) is details
+    assert sum(call.args[0] == "POST" for call in adapter._request.call_args_list) == 1
 
 
 def test_invalid_identifier_before_request(adapter):

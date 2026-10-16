@@ -77,7 +77,8 @@ class JapanSVM:
     """Capture mixin using the Japan adapter's sanitized HTTP helpers."""
 
     _SVM_POLL_INTERVAL_SECONDS = 5
-    _SVM_POLL_TIMEOUT_SECONDS = 120
+    # Japan's app allows 145 seconds for the vehicle to upload its capture.
+    _SVM_POLL_TIMEOUT_SECONDS = 145
 
     def get_svm_details(self, token, vehicle) -> SVMDetails:
         """Return this session's last completed capture without waking the car."""
