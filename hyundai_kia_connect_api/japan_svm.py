@@ -12,8 +12,11 @@ import re
 import time
 
 from .exceptions import (
+    APIError,
+    AuthenticationError,
     InvalidAPIResponseError,
     NoDataFound,
+    RateLimitingError,
     RequestTimeoutError,
     SafetyAcknowledgmentError,
     UnsupportedControlError,
@@ -80,6 +83,15 @@ class JapanSVM:
     # Japan's app allows 145 seconds for the vehicle to upload its capture.
     _SVM_POLL_TIMEOUT_SECONDS = 145
 
+    @property
+    def svm_diagnostics(self) -> dict:
+        """Describe only the latest local capture workflow, without private data."""
+        summary = dict(getattr(self, "_japan_svm_diagnostics", {"stage": "idle"}))
+        started = getattr(self, "_japan_svm_started", None)
+        if started is not None:
+            summary["elapsed_seconds"] = round(max(0, time.perf_counter() - started), 1)
+        return summary
+
     def get_svm_details(self, token, vehicle) -> SVMDetails:
         """Return this session's last completed capture without waking the car."""
         details = getattr(self, "_japan_svm_cache", {}).get(vehicle.id)
@@ -89,6 +101,46 @@ class JapanSVM:
 
     def request_svm_capture(
         self, token, vehicle, acknowledged_warning: bool = False
+    ) -> SVMDetails:
+        """Keep a secret-free workflow outcome even when a capture fails."""
+        self._japan_svm_started = time.perf_counter()
+        self._japan_svm_diagnostics = {
+            "stage": "validation",
+            "poll_count": 0,
+            "image_present": False,
+            "dimensions_present": False,
+            "failure_category": None,
+        }
+        try:
+            return self._request_japan_svm_capture(token, vehicle, acknowledged_warning)
+        except Exception as exc:
+            category = "unexpected"
+            for error_type, label in (
+                (AuthenticationError, "authentication"),
+                (SafetyAcknowledgmentError, "acknowledgment"),
+                (UnsupportedControlError, "unsupported"),
+                (RequestTimeoutError, "timeout"),
+                (InvalidAPIResponseError, "invalid_response"),
+                (RateLimitingError, "rate_limit"),
+                (APIError, "api_rejected"),
+            ):
+                if isinstance(exc, error_type):
+                    category = label
+                    break
+            self._japan_svm_diagnostics.update(
+                failed_stage=self._japan_svm_diagnostics["stage"],
+                stage="failed",
+                failure_category=category,
+            )
+            raise
+        finally:
+            self._japan_svm_diagnostics["elapsed_seconds"] = round(
+                max(0, time.perf_counter() - self._japan_svm_started), 1
+            )
+            self._japan_svm_started = None
+
+    def _request_japan_svm_capture(
+        self, token, vehicle, acknowledged_warning: bool
     ) -> SVMDetails:
         """Request once and poll only that request; an ACK is not an image."""
         if acknowledged_warning is not True:
@@ -105,16 +157,21 @@ class JapanSVM:
             raise InvalidAPIResponseError("Japan vehicle identifier is invalid")
         # The app's camera flow validates its PIN grant before requesting an
         # image, but SVMApi deliberately uses the ordinary OAuth authorization.
+        self._japan_svm_diagnostics["stage"] = "pin"
         self._control_headers(token, vehicle)
         path = f"/api/v1/spa/vehicles/{vehicle.id}/svm/async"
+        self._japan_svm_diagnostics["stage"] = "submission"
         result = self._request(
             "POST", path, headers=self._vehicle_headers(token, vehicle)
         )
         message_id = result.get("msgId")
         if not isinstance(message_id, str) or not message_id:
             raise InvalidAPIResponseError("Japan camera request identifier is missing")
+        self._japan_svm_diagnostics["stage"] = "submitted"
         deadline = time.monotonic() + self._SVM_POLL_TIMEOUT_SECONDS
         while time.monotonic() < deadline:
+            self._japan_svm_diagnostics["stage"] = "polling"
+            self._japan_svm_diagnostics["poll_count"] += 1
             try:
                 result = self._request(
                     "GET",
@@ -128,6 +185,11 @@ class JapanSVM:
                     time.sleep(min(self._SVM_POLL_INTERVAL_SECONDS, remaining))
                 continue
             details = parse_japan_svm(self._payload(result), self.data_timezone)
+            self._japan_svm_diagnostics.update(
+                stage="complete",
+                image_present=bool(details.image_bytes),
+                dimensions_present=details.image_size is not None,
+            )
             if not hasattr(self, "_japan_svm_cache"):
                 self._japan_svm_cache = {}
             self._japan_svm_cache[vehicle.id] = details

@@ -162,6 +162,10 @@ def test_timeout_and_rejection_do_not_repeat_capture(adapter, monkeypatch):
     with pytest.raises(RequestTimeoutError):
         adapter.request_svm_capture(None, Vehicle(id="CAR", supports_svm=True), True)
     assert adapter._request.call_count == 2
+    assert adapter.svm_diagnostics["stage"] == "failed"
+    assert adapter.svm_diagnostics["failed_stage"] == "polling"
+    assert adapter.svm_diagnostics["failure_category"] == "timeout"
+    assert adapter.svm_diagnostics["poll_count"] == 1
 
 
 def test_slow_vehicle_upload_within_app_polling_window_is_displayable(
@@ -197,3 +201,60 @@ def test_invalid_identifier_before_request(adapter):
     with pytest.raises(InvalidAPIResponseError):
         adapter.request_svm_capture(None, Vehicle(id="../CAR", supports_svm=True), True)
     adapter._request.assert_not_called()
+
+
+def test_workflow_diagnostics_track_pending_and_success_without_private_data(
+    adapter, monkeypatch
+):
+    monkeypatch.setattr("hyundai_kia_connect_api.japan_svm.time.sleep", lambda _: None)
+    observed = []
+
+    def request(method, path, **kwargs):
+        observed.append(adapter.svm_diagnostics)
+        if method == "POST":
+            return {"msgId": "PRIVATE_MESSAGE_ID"}
+        if len(observed) == 2:
+            raise NoDataFound("PRIVATE_VENDOR_MESSAGE")
+        return {"resMsg": payload()}
+
+    adapter._request.side_effect = request
+    adapter.request_svm_capture(
+        None, Vehicle(id="PRIVATE_CAR", supports_svm=True), True
+    )
+    summary = adapter.svm_diagnostics
+    assert [item["stage"] for item in observed] == ["submission", "polling", "polling"]
+    assert summary["stage"] == "complete"
+    assert summary["poll_count"] == 2
+    assert summary["image_present"] is True
+    assert summary["dimensions_present"] is True
+    assert summary["elapsed_seconds"] >= 0
+    assert summary["failure_category"] is None
+    assert "PRIVATE" not in repr(summary)
+    assert "SYNTHETIC_IMAGE" not in repr(summary)
+    summary["stage"] = "modified"
+    assert adapter.svm_diagnostics["stage"] == "complete"
+
+
+@pytest.mark.parametrize(
+    ("failure", "category"),
+    [
+        (AuthenticationError("PRIVATE_VENDOR_MESSAGE"), "authentication"),
+        (RuntimeError("PRIVATE_TOKEN"), "unexpected"),
+    ],
+)
+def test_workflow_diagnostics_preserve_safe_failure(adapter, failure, category):
+    adapter._control_headers.side_effect = failure
+    with pytest.raises(type(failure)):
+        adapter.request_svm_capture(
+            None, Vehicle(id="PRIVATE_CAR", supports_svm=True), True
+        )
+    summary = adapter.svm_diagnostics
+    assert summary["stage"] == "failed"
+    assert summary["failed_stage"] == "pin"
+    assert summary["failure_category"] == category
+    assert summary["poll_count"] == 0
+    assert summary["image_present"] is False
+    assert summary["dimensions_present"] is False
+    assert summary["elapsed_seconds"] >= 0
+    assert "PRIVATE" not in repr(summary)
+    assert adapter.svm_diagnostics == summary

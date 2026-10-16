@@ -628,3 +628,77 @@ def test_command_values_match_independent_dex_constructor_facts():
             ),
         )
         assert api._request.call_args.kwargs["json"] == {"command": facts[enum_name]}
+
+
+@pytest.mark.parametrize(
+    "status,stage",
+    [
+        (ORDER_STATUS.PENDING, "waiting"),
+        (ORDER_STATUS.SUCCESS, "success"),
+        (ORDER_STATUS.FAILED, "failed"),
+        (ORDER_STATUS.TIMEOUT, "timeout"),
+    ],
+)
+def test_command_diagnostics_track_completion_without_identifiers(status, stage):
+    api, token, vehicle = setup()
+    action = api.lock_action(token, vehicle, VEHICLE_LOCK_ACTION.UNLOCK)
+    assert api._japan_command_diagnostics == {
+        "endpoint": "door",
+        "command": "open",
+        "stage": "waiting",
+    }
+    api.helper.status.return_value = status
+    api.check_action_status(token, vehicle, action)
+    assert api._japan_command_diagnostics["stage"] == stage
+    serialized = json.dumps(api._japan_command_diagnostics)
+    for secret in (
+        vehicle.id,
+        action,
+        token.pin,
+        token.device_id,
+        "Authorization",
+        "synthetic-access",
+        "synthetic-control",
+    ):
+        assert secret not in serialized
+
+
+@pytest.mark.parametrize(
+    "failure_at,expected",
+    [
+        ("pin", "pin_validation"),
+        ("mqtt", "mqtt_setup"),
+        ("http", "http_submitting"),
+        ("status", "waiting"),
+    ],
+)
+def test_command_diagnostics_preserve_sanitized_failure_stage(failure_at, expected):
+    api, token, vehicle = setup()
+    error = InvalidAPIResponseError("private-token-and-location")
+    if failure_at == "pin":
+        api._request.side_effect = error
+    elif failure_at == "mqtt":
+        api.helper.prepare.side_effect = error
+    elif failure_at == "http":
+        api._request.side_effect = [
+            {"controlToken": "synthetic-control", "expiresTime": 60},
+            error,
+        ]
+    with pytest.raises(InvalidAPIResponseError):
+        action = api.lock_action(token, vehicle, VEHICLE_LOCK_ACTION.UNLOCK)
+        if failure_at == "status":
+            api.helper.status.side_effect = error
+            api.check_action_status(token, vehicle, action)
+    diagnostic = api._japan_command_diagnostics
+    assert diagnostic["stage"] == "failed"
+    assert diagnostic["failed_stage"] == expected
+    assert diagnostic["failure_category"] == "invalid_response"
+    assert "private-token-and-location" not in json.dumps(diagnostic)
+
+
+def test_command_diagnostics_do_not_copy_unknown_endpoint_or_payload():
+    api, token, vehicle = setup()
+    api._japan_command(
+        token, vehicle, "private-location-token", {"command": "private-secret"}
+    )
+    assert api._japan_command_diagnostics == {"endpoint": "other", "stage": "waiting"}

@@ -130,6 +130,8 @@ class HyundaiBlueLinkApiJP(JapanCommandsMixin, JapanSVM, ApiImpl):
         return {
             "mqtt_sessions": [helper.diagnostics for _, helper in sessions],
             "svm_images_cached": len(getattr(self, "_japan_svm_cache", {})),
+            "last_command": dict(getattr(self, "_japan_command_diagnostics", {})),
+            "last_camera_capture": self.svm_diagnostics,
         }
 
     def close(self) -> None:

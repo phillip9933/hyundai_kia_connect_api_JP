@@ -24,4 +24,6 @@ def test_local_diagnostics_before_any_capture_or_connection():
     assert api.get_local_diagnostics() == {
         "mqtt_sessions": [],
         "svm_images_cached": 0,
+        "last_command": {},
+        "last_camera_capture": {"stage": "idle"},
     }

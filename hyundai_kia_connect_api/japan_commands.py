@@ -102,16 +102,68 @@ class JapanCommandsMixin:
                 evicted[1].close()
         self._japan_actions[action_id] = (vehicle_id, helper, None)
 
+    def _record_japan_command_failure(self, error):
+        category = "other"
+        if isinstance(error, AuthenticationError):
+            category = "authentication"
+        elif isinstance(error, InvalidAPIResponseError):
+            category = "invalid_response"
+        elif isinstance(error, ValueError):
+            category = "invalid_input"
+        diagnostic = getattr(self, "_japan_command_diagnostics", {})
+        diagnostic["failed_stage"] = diagnostic.get("stage", "unknown")
+        diagnostic["stage"] = "failed"
+        diagnostic["failure_category"] = category
+        self._japan_command_diagnostics = diagnostic
+
     def _japan_command(self, token, vehicle, endpoint, payload, *, ccs2=True):
-        vehicle_id = self._command_vehicle_id(vehicle)
-        # Validate PIN before connecting MQTT or performing any command request.
-        headers = self._control_headers(token, vehicle)
-        helper = self._mqtt_for_vehicle(token, vehicle)
+        endpoints = {
+            "control/door": "door",
+            "control/portdoor": "portdoor",
+            "control/charge": "charge",
+            "control/temperature": "temperature",
+            "control/window": "window",
+            "control/windowcurtain": "windowcurtain",
+            "control/hornlight": "hornlight",
+            "control/light": "light",
+            "control/valet": "valet",
+            "location/routes": "routes",
+            "charge/chargingcurrent": "chargingcurrent",
+            "charge/dischargelimit": "dischargelimit",
+            "reservation/chargehvac": "chargehvac",
+            "reservation/charge": "charge_schedule",
+            "reservation/hvac": "hvac_schedule",
+        }
+        self._japan_diagnostic_action_id = None
+        self._japan_command_diagnostics = {
+            "endpoint": endpoints.get(endpoint, "other"),
+            "stage": "pin_validation",
+        }
+        command = payload.get("command") if isinstance(payload, dict) else None
+        if isinstance(command, str) and command in {
+            "open",
+            "close",
+            "start",
+            "stop",
+            "on",
+            "lowbeam",
+        }:
+            self._japan_command_diagnostics["command"] = command
+        try:
+            vehicle_id = self._command_vehicle_id(vehicle)
+            # Validate PIN before connecting MQTT or performing any command request.
+            headers = self._control_headers(token, vehicle)
+            self._japan_command_diagnostics["stage"] = "mqtt_setup"
+            helper = self._mqtt_for_vehicle(token, vehicle)
+        except Exception as error:
+            self._record_japan_command_failure(error)
+            raise
         try:
             helper.prepare()
             authorization = headers["Authorization"]
             headers = self._vehicle_headers(token, vehicle, helper)
             headers["Authorization"] = authorization
+            self._japan_command_diagnostics["stage"] = "http_submitting"
             result = self._request(
                 "POST",
                 f"/api/v2/spa/vehicles/{vehicle_id}/"
@@ -120,13 +172,17 @@ class JapanCommandsMixin:
                 headers=headers,
                 json=payload,
             )
+            self._japan_command_diagnostics["stage"] = "http_submitted"
             action_id = result.get("msgId")
             if not isinstance(action_id, str) or not action_id:
                 raise InvalidAPIResponseError(
                     "Japan command tracking identifier is missing"
                 )
             helper.track(action_id)
-        except Exception:
+            self._japan_diagnostic_action_id = action_id
+            self._japan_command_diagnostics["stage"] = "waiting"
+        except Exception as error:
+            self._record_japan_command_failure(error)
             helper.close()
             raise
         self._remember_japan_action(action_id, vehicle_id, helper)
@@ -172,9 +228,21 @@ class JapanCommandsMixin:
             status = helper.status(
                 action_id, timeout=min(timeout, 120) if synchronous else 0
             )
-        except Exception:
+        except Exception as error:
+            if action_id == getattr(self, "_japan_diagnostic_action_id", None):
+                self._record_japan_command_failure(error)
             helper.close()
             raise
+        stages = {
+            ORDER_STATUS.SUCCESS: "success",
+            ORDER_STATUS.FAILED: "failed",
+            ORDER_STATUS.TIMEOUT: "timeout",
+            ORDER_STATUS.PENDING: "waiting",
+        }
+        if status in stages and action_id == getattr(
+            self, "_japan_diagnostic_action_id", None
+        ):
+            self._japan_command_diagnostics["stage"] = stages[status]
         if status in (ORDER_STATUS.SUCCESS, ORDER_STATUS.FAILED, ORDER_STATUS.TIMEOUT):
             self._japan_actions[action_id] = (vehicle_id, helper, status)
             if not any(
