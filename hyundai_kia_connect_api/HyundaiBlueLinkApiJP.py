@@ -124,6 +124,14 @@ class HyundaiBlueLinkApiJP(JapanCommandsMixin, JapanSVM, ApiImpl):
             return helper
         return existing[1]
 
+    def get_local_diagnostics(self) -> dict:
+        """Return bounded protocol counters without requests or private data."""
+        sessions = list(self._mqtt_sessions.values())[:10]
+        return {
+            "mqtt_sessions": [helper.diagnostics for _, helper in sessions],
+            "svm_images_cached": len(getattr(self, "_japan_svm_cache", {})),
+        }
+
     def close(self) -> None:
         """Release Japan MQTT and HTTP sessions on integration unload."""
         for _, helper in self._mqtt_sessions.values():

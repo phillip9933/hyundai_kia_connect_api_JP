@@ -78,6 +78,25 @@ class JapanMqttSession:
         self._topics = ()
         self._pending_context = {}
         self._request_context = {}
+        self._diagnostics = dict.fromkeys(
+            (
+                "messages_received",
+                "retained_messages",
+                "oversized_messages",
+                "malformed_messages",
+                "vss_messages",
+                "result_messages",
+                "connection_messages",
+                "other_topic_messages",
+                "missing_sid_messages",
+                "unknown_result_messages",
+                "matched_results",
+                "unmatched_result_messages",
+                "commands_tracked",
+            ),
+            0,
+        )
+        self._last_status = "not_started"
 
     def _http(
         self, method: str, path: str, *, headers=None, allow_not_found=False, **kwargs
@@ -314,6 +333,7 @@ class JapanMqttSession:
     def _fail(self, message):
         with self._condition:
             self._error = message
+            self._last_status = "connection_error"
             self._condition.notify_all()
 
     def _on_connect(self, client, userdata, flags, reason_code, properties):
@@ -336,6 +356,7 @@ class JapanMqttSession:
         with self._condition:
             if not self._closed:
                 self._error = "Japan MQTT connection was lost"
+                self._last_status = "connection_error"
             self._ready = False
             self._condition.notify_all()
 
@@ -353,18 +374,29 @@ class JapanMqttSession:
             self._condition.notify_all()
 
     def _on_message(self, client, userdata, message):
-        if message.retain or len(message.payload) > self.MAX_MESSAGE_BYTES:
-            return
+        with self._condition:
+            self._diagnostics["messages_received"] += 1
+            if message.retain:
+                self._diagnostics["retained_messages"] += 1
+                return
+            if len(message.payload) > self.MAX_MESSAGE_BYTES:
+                self._diagnostics["oversized_messages"] += 1
+                return
         try:
             payload = json.loads(message.payload)
         except (ValueError, UnicodeDecodeError):
+            with self._condition:
+                self._diagnostics["malformed_messages"] += 1
             return
         if not isinstance(payload, dict):
+            with self._condition:
+                self._diagnostics["malformed_messages"] += 1
             return
         with self._condition:
             if self._closed or not self._topics:
                 return
             if message.topic == self._topics[0]:
+                self._diagnostics["vss_messages"] += 1
                 state = (
                     payload.get("state", {}).get("Vehicle")
                     if isinstance(payload.get("state"), dict)
@@ -373,14 +405,25 @@ class JapanMqttSession:
                 if isinstance(state, dict):
                     self._latest_state = deepcopy(state)
             elif message.topic == self._topics[1]:
+                self._diagnostics["result_messages"] += 1
                 sid = payload.get("sid")
                 if not isinstance(sid, str) or not sid:
+                    self._diagnostics["missing_sid_messages"] += 1
                     return
+                if payload.get("res-msg") not in ("S", "F"):
+                    self._diagnostics["unknown_result_messages"] += 1
+                if sid not in self._tracked:
+                    self._diagnostics["unmatched_result_messages"] += 1
                 result = (
                     ORDER_STATUS.SUCCESS
                     if payload.get("res-msg") == "S"
                     else ORDER_STATUS.FAILED
                 )
+                if sid in self._tracked and sid not in self._results:
+                    self._diagnostics["matched_results"] += 1
+                    self._last_status = (
+                        "success" if result == ORDER_STATUS.SUCCESS else "failed"
+                    )
                 self._results.setdefault(sid, result)
                 self._results.move_to_end(sid)
                 while len(self._results) > self.MAX_RESULTS:
@@ -390,6 +433,10 @@ class JapanMqttSession:
                     if untracked is None:
                         break
                     del self._results[untracked]
+            elif message.topic == self._topics[2]:
+                self._diagnostics["connection_messages"] += 1
+            else:
+                self._diagnostics["other_topic_messages"] += 1
             self._condition.notify_all()
 
     def track(self, action_id: str) -> None:
@@ -405,7 +452,19 @@ class JapanMqttSession:
                 and len(self._tracked) >= self.MAX_RESULTS
             ):
                 raise APIError("Japan MQTT session command limit reached")
+            if action_id not in self._tracked:
+                self._diagnostics["commands_tracked"] += 1
+                if action_id in self._results:
+                    self._diagnostics["matched_results"] += 1
             self._tracked.add(action_id)
+            result = self._results.get(action_id)
+            self._last_status = (
+                "pending"
+                if result is None
+                else "success"
+                if result == ORDER_STATUS.SUCCESS
+                else "failed"
+            )
 
     def status(self, action_id: str, timeout: float = 0) -> ORDER_STATUS:
         """Return correlated completion; bounded waits never assume success."""
@@ -430,7 +489,20 @@ class JapanMqttSession:
             self._raise_error()
             if self._closed:
                 raise APIError("Japan MQTT session is closed")
+            if not ready:
+                self._last_status = "timeout"
             return self._results[action_id] if ready else ORDER_STATUS.TIMEOUT
+
+    @property
+    def diagnostics(self) -> dict:
+        """Return identifier-free counters, retained after session close."""
+        with self._condition:
+            return {
+                **self._diagnostics,
+                "last_status": self._last_status,
+                "ready": self._ready,
+                "closed": self._closed,
+            }
 
     @property
     def request_context(self) -> dict[str, str]:

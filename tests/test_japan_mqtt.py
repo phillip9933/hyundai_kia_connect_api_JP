@@ -501,3 +501,91 @@ def test_required_json_body_is_strict_with_safe_stage_diagnostics(
     )
     assert "synthetic-private-response" not in str(caught.value)
     client.connect_async.assert_not_called()
+
+
+def test_diagnostic_counters_are_safe_copied_and_survive_close(session):
+    instance, client = session
+    instance.prepare()
+    instance.track("private-action")
+    for topic, payload in (
+        (instance._topics[0], {"state": {"Vehicle": {"private": "data"}}}),
+        (instance._topics[2], {"state": "ONLINE"}),
+        ("private-other-topic", {}),
+        (instance._topics[1], {}),
+        (instance._topics[1], {"sid": "private-other", "res-msg": "private-unknown"}),
+        (instance._topics[1], {"sid": "private-action", "res-msg": "S"}),
+    ):
+        instance._on_message(client, None, message(topic, payload))
+    summary = instance.diagnostics
+    assert summary["messages_received"] == 6
+    assert summary["vss_messages"] == 1
+    assert summary["connection_messages"] == 1
+    assert summary["other_topic_messages"] == 1
+    assert summary["result_messages"] == 3
+    assert summary["missing_sid_messages"] == 1
+    assert summary["unknown_result_messages"] == 1
+    assert summary["unmatched_result_messages"] == 1
+    assert summary["matched_results"] == 1
+    assert summary["commands_tracked"] == 1
+    assert summary["last_status"] == "success"
+    assert "private" not in json.dumps(summary)
+    summary["matched_results"] = 999
+    instance.close()
+    assert instance.diagnostics["matched_results"] == 1
+    assert instance.diagnostics["last_status"] == "success"
+    assert instance.diagnostics["closed"] is True
+    assert instance.diagnostics["ready"] is False
+
+
+def test_diagnostics_count_invalid_messages_without_recording_payload(session):
+    instance, client = session
+    instance.prepare()
+    for payload in (b"private-invalid-json", b"[]"):
+        instance._on_message(
+            client,
+            None,
+            SimpleNamespace(
+                topic=instance._topics[1],
+                payload=payload,
+                retain=False,
+            ),
+        )
+    instance._on_message(client, None, message(instance._topics[1], {}, retained=True))
+    instance._on_message(
+        client,
+        None,
+        SimpleNamespace(
+            topic=instance._topics[1],
+            payload=b"x" * (instance.MAX_MESSAGE_BYTES + 1),
+            retain=False,
+        ),
+    )
+    assert instance.diagnostics["messages_received"] == 4
+    assert instance.diagnostics["malformed_messages"] == 2
+    assert instance.diagnostics["retained_messages"] == 1
+    assert instance.diagnostics["oversized_messages"] == 1
+    assert "private" not in json.dumps(instance.diagnostics)
+
+
+def test_diagnostics_track_early_results_once_and_timeout(session):
+    instance, client = session
+    instance.prepare()
+    instance._on_message(
+        client,
+        None,
+        message(
+            instance._topics[1],
+            {
+                "sid": "private-early",
+                "res-msg": "S",
+            },
+        ),
+    )
+    instance.track("private-early")
+    instance.track("private-early")
+    assert instance.diagnostics["matched_results"] == 1
+    assert instance.diagnostics["commands_tracked"] == 1
+    instance.track("private-pending")
+    assert instance.status("private-pending", timeout=0.001) == ORDER_STATUS.TIMEOUT
+    instance.close()
+    assert instance.diagnostics["last_status"] == "timeout"
