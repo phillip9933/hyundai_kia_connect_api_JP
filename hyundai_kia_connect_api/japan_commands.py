@@ -63,7 +63,16 @@ class JapanCommandsMixin:
         self._require_mqtt_identity(token)
         if not isinstance(token.pin, str) or not token.pin.strip():
             raise AuthenticationError("Japan vehicle commands require an explicit PIN")
-        if not token.control_token or token.control_token_expiry <= time.time():
+        expiry = token.control_token_expiry
+        if (
+            not isinstance(token.control_token, str)
+            or not token.control_token.startswith("Bearer ")
+            or not token.control_token[7:].strip()
+            or isinstance(expiry, bool)
+            or not isinstance(expiry, (int, float))
+            or not math.isfinite(expiry)
+            or expiry <= time.time()
+        ):
             result = self._request(
                 "PUT",
                 "/api/v1/user/pin",
@@ -96,9 +105,16 @@ class JapanCommandsMixin:
     def _remember_japan_action(self, action_id, vehicle_id, helper=None):
         if not hasattr(self, "_japan_actions"):
             self._japan_actions = {}
-        if len(self._japan_actions) >= 128:
+        if action_id not in self._japan_actions and len(self._japan_actions) >= 128:
             evicted = self._japan_actions.pop(next(iter(self._japan_actions)))
-            if evicted[1] is not None and not isinstance(evicted[1], tuple):
+            if (
+                evicted[1] is not None
+                and not isinstance(evicted[1], tuple)
+                and not any(
+                    entry[1] is evicted[1] and entry[2] is None
+                    for entry in self._japan_actions.values()
+                )
+            ):
                 evicted[1].close()
         self._japan_actions[action_id] = (vehicle_id, helper, None)
 
@@ -160,7 +176,9 @@ class JapanCommandsMixin:
             raise
         try:
             helper.prepare()
-            authorization = headers["Authorization"]
+            # MQTT bootstrap may outlast a nearly expired cached PIN grant.
+            # Recheck it immediately before the control request is submitted.
+            authorization = self._control_headers(token, vehicle)["Authorization"]
             headers = self._vehicle_headers(token, vehicle, helper)
             headers["Authorization"] = authorization
             self._japan_command_diagnostics["stage"] = "http_submitting"
@@ -202,21 +220,6 @@ class JapanCommandsMixin:
         if helper is None:
             # Stored charge settings have completed at the authenticated HTTP layer.
             return ORDER_STATUS.SUCCESS
-        if isinstance(helper, tuple):
-            statuses = [
-                self.check_action_status(token, vehicle, child, synchronous, timeout)
-                for child in helper
-            ]
-            if ORDER_STATUS.FAILED in statuses:
-                status = ORDER_STATUS.FAILED
-            elif ORDER_STATUS.TIMEOUT in statuses:
-                status = ORDER_STATUS.TIMEOUT
-            elif all(value == ORDER_STATUS.SUCCESS for value in statuses):
-                status = ORDER_STATUS.SUCCESS
-            else:
-                return ORDER_STATUS.PENDING
-            self._japan_actions[action_id] = (vehicle_id, helper, status)
-            return status
         if synchronous and (
             isinstance(timeout, bool)
             or not isinstance(timeout, (int, float))
@@ -224,6 +227,28 @@ class JapanCommandsMixin:
             or timeout <= 0
         ):
             raise ValueError("Japan synchronous status requires a positive timeout")
+        if isinstance(helper, tuple):
+            deadline = time.monotonic() + min(timeout, 120) if synchronous else None
+            statuses = []
+            for child in helper:
+                remaining = max(0, deadline - time.monotonic()) if synchronous else 0
+                statuses.append(
+                    self.check_action_status(
+                        token, vehicle, child, synchronous and remaining > 0, remaining
+                    )
+                )
+            if ORDER_STATUS.FAILED in statuses:
+                status = ORDER_STATUS.FAILED
+            elif ORDER_STATUS.TIMEOUT in statuses:
+                status = ORDER_STATUS.TIMEOUT
+            elif all(value == ORDER_STATUS.SUCCESS for value in statuses):
+                status = ORDER_STATUS.SUCCESS
+            elif synchronous and time.monotonic() >= deadline:
+                status = ORDER_STATUS.TIMEOUT
+            else:
+                return ORDER_STATUS.PENDING
+            self._japan_actions[action_id] = (vehicle_id, helper, status)
+            return status
         try:
             status = helper.status(
                 action_id, timeout=min(timeout, 120) if synchronous else 0
@@ -610,12 +635,10 @@ class JapanCommandsMixin:
                 options.defrost,
             )
         )
-        actions = []
+        requests = []
         if charge_active:
-            actions.append(
-                self._japan_command(
-                    token,
-                    vehicle,
+            requests.append(
+                (
                     "reservation/charge",
                     {
                         "reservFlag": payload["reservFlag"],
@@ -634,6 +657,12 @@ class JapanCommandsMixin:
                     raise InvalidAPIResponseError(
                         "Japan flat climate schedule is incomplete"
                     )
+                if "reservChargeSet" not in detail or any(
+                    key not in fatc for key in ("airCtrl", "defrost", "airTemp")
+                ):
+                    raise InvalidAPIResponseError(
+                        "Japan flat climate schedule is incomplete"
+                    )
                 climate[f"reservedHVACInfo{index}"] = {
                     "reservHVACflag": int(detail["reservChargeSet"]),
                     "reservInfo": detail["reservInfo"],
@@ -641,9 +670,12 @@ class JapanCommandsMixin:
                         key: fatc[key] for key in ("airCtrl", "defrost", "airTemp")
                     },
                 }
-            actions.append(
-                self._japan_command(token, vehicle, "reservation/hvac", climate)
-            )
+            requests.append(("reservation/hvac", climate))
+        # Validate both wire envelopes before either setting can be changed.
+        actions = [
+            self._japan_command(token, vehicle, endpoint, body)
+            for endpoint, body in requests
+        ]
         if len(actions) == 1:
             return actions[0]
         action_id = str(uuid.uuid4())

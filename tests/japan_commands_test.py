@@ -702,3 +702,133 @@ def test_command_diagnostics_do_not_copy_unknown_endpoint_or_payload():
         token, vehicle, "private-location-token", {"command": "private-secret"}
     )
     assert api._japan_command_diagnostics == {"endpoint": "other", "stage": "waiting"}
+
+
+def test_expired_control_grant_is_renewed_after_slow_mqtt_setup(monkeypatch):
+    api, token, vehicle = setup()
+    clock = [100.0]
+    monkeypatch.setattr(
+        "hyundai_kia_connect_api.japan_commands.time.time", lambda: clock[0]
+    )
+    token.control_token = "Bearer synthetic-old-control"
+    token.control_token_expiry = 101
+    api.helper.prepare.side_effect = lambda: clock.__setitem__(0, 200.0)
+    api.lock_action(token, vehicle, VEHICLE_LOCK_ACTION.UNLOCK)
+    grant, command = api._request.call_args_list
+    assert grant.args == ("PUT", "/api/v1/user/pin")
+    assert command.kwargs["headers"]["Authorization"] == "Bearer synthetic-control"
+    assert token.control_token_expiry == 260
+
+
+@pytest.mark.parametrize("expiry", [None, "300", True, float("nan"), float("inf")])
+def test_malformed_cached_grant_expiry_is_renewed(expiry):
+    api, token, vehicle = setup()
+    token.control_token = "Bearer synthetic-old-control"
+    token.control_token_expiry = expiry
+    api.start_charge(token, vehicle)
+    assert api._request.call_args_list[0].args == ("PUT", "/api/v1/user/pin")
+
+
+def test_action_eviction_keeps_shared_pending_mqtt_session():
+    api, _, vehicle = setup()
+    api._remember_japan_action("oldest", vehicle.id, api.helper)
+    for index in range(127):
+        api._remember_japan_action(f"pending-{index}", vehicle.id, api.helper)
+    api._remember_japan_action("newest", vehicle.id, api.helper)
+    api.helper.close.assert_not_called()
+    assert len(api._japan_actions) == 128
+    assert "oldest" not in api._japan_actions
+
+
+def test_replacing_tracked_action_does_not_evict_unrelated_action():
+    api, _, vehicle = setup()
+    for index in range(128):
+        api._remember_japan_action(f"action-{index}", vehicle.id, api.helper)
+    api._remember_japan_action("action-127", vehicle.id, api.helper)
+    assert len(api._japan_actions) == 128
+    assert "action-0" in api._japan_actions
+    api.helper.close.assert_not_called()
+
+
+def test_composite_completion_shares_one_wait_budget(monkeypatch):
+    api, token, vehicle = setup()
+    clock = [0.0]
+    monkeypatch.setattr(
+        "hyundai_kia_connect_api.japan_commands.time.monotonic", lambda: clock[0]
+    )
+    api._remember_japan_action("first", vehicle.id, api.helper)
+    api._remember_japan_action("second", vehicle.id, api.helper)
+    api._remember_japan_action("aggregate", vehicle.id, ("first", "second"))
+
+    def status(action_id, timeout):
+        if action_id == "first":
+            clock[0] += 40
+            return ORDER_STATUS.SUCCESS
+        assert timeout == 20
+        clock[0] += timeout
+        return ORDER_STATUS.TIMEOUT
+
+    api.helper.status.side_effect = status
+    assert (
+        api.check_action_status(token, vehicle, "aggregate", True, 60)
+        == ORDER_STATUS.TIMEOUT
+    )
+    assert clock[0] == 60
+    api.helper.close.assert_called_once()
+
+
+@pytest.mark.parametrize("timeout", [0, -1, True, None, float("nan")])
+def test_composite_rejects_invalid_wait_before_polling(timeout):
+    api, token, vehicle = setup()
+    api._remember_japan_action("first", vehicle.id, api.helper)
+    api._remember_japan_action("aggregate", vehicle.id, ("first",))
+    with pytest.raises(ValueError, match="positive timeout"):
+        api.check_action_status(token, vehicle, "aggregate", True, timeout)
+    api.helper.status.assert_not_called()
+
+
+@pytest.mark.parametrize("missing", ["defrost", "reservChargeSet"])
+def test_flat_schedule_validates_both_envelopes_before_either_write(missing):
+    api, token, vehicle = setup()
+    api._vehicle_profiles[vehicle.id]["appMode"] = "EV5"
+    detail = {
+        "reservChargeSet": True,
+        "reservInfo": {"day": [1], "time": {"time": "0800", "timeSection": 0}},
+        "reservFatcSet": {
+            "airCtrl": 1,
+            "defrost": False,
+            "airTemp": {"value": "0CH", "unit": 0, "hvacTempType": 1},
+        },
+    }
+    if missing == "defrost":
+        del detail["reservFatcSet"][missing]
+    else:
+        del detail[missing]
+    current = {
+        "reservFlag": 1,
+        "reservChargeInfo": {"reservChargeInfoDetail": detail},
+        "reservChargeInfo2": {"reservChargeInfoDetail": copy.deepcopy(detail)},
+        "offPeakPowerInfo": {
+            "offPeakPowerFlag": 2,
+            "offPeakPowerTime1": {
+                "starttime": {"time": "1000", "timeSection": 1},
+                "endtime": {"time": "0700", "timeSection": 0},
+            },
+        },
+    }
+    api._payload = lambda result: result["resMsg"]
+    api._request.side_effect = [
+        {"controlToken": "synthetic-control", "expiresTime": 60},
+        {"resMsg": current},
+    ]
+    api._japan_command = Mock()
+    with pytest.raises(InvalidAPIResponseError, match="flat climate schedule"):
+        api.schedule_charging_and_climate(
+            token,
+            vehicle,
+            ScheduleChargingClimateRequestOptions(
+                charging_enabled=False, temperature=20
+            ),
+        )
+    api._japan_command.assert_not_called()
+    assert [call.args[0] for call in api._request.call_args_list] == ["PUT", "GET"]

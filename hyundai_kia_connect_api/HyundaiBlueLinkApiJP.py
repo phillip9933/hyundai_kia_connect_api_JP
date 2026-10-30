@@ -154,7 +154,8 @@ class HyundaiBlueLinkApiJP(JapanCommandsMixin, JapanSVM, ApiImpl):
     def _force_refresh_with_session(self, token, vehicle, helper, headers):
         vehicle_id = self._command_vehicle_id(vehicle)
         helper.prepare()
-        authorization = headers["Authorization"]
+        # A cached PIN grant can expire while MQTT bootstrap is in progress.
+        authorization = self._control_headers(token, vehicle)["Authorization"]
         headers = self._vehicle_headers(token, vehicle, helper)
         headers["Authorization"] = authorization
         deadline = time.monotonic() + self.FORCE_REFRESH_TIMEOUT

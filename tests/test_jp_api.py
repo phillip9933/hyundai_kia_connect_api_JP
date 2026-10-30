@@ -1120,3 +1120,37 @@ def test_additional_public_server_error_labels_are_fixed(api, code, label):
         api._request("POST", "/api/v1/spa/vehicles/synthetic/svm/async")
     assert code in str(raised.value) and label in str(raised.value)
     assert secret not in str(raised.value)
+
+
+def test_force_refresh_renews_control_grant_after_slow_connection(api, monkeypatch):
+    clock = [1790000000.0]
+    monkeypatch.setattr(
+        "hyundai_kia_connect_api.japan_commands.time.time", lambda: clock[0]
+    )
+    helper = Mock()
+    helper.request_context = {}
+    helper.prepare.side_effect = lambda: clock.__setitem__(0, 1790000100.0)
+    helper.status.return_value = ORDER_STATUS.FAILED
+    monkeypatch.setattr(api, "_mqtt_for_vehicle", lambda *args: helper)
+    api._request = Mock(
+        side_effect=[
+            {"controlToken": "synthetic-fresh-grant", "expiresTime": 60},
+            {"msgId": "synthetic-action"},
+        ]
+    )
+    token = Token(
+        pin="synthetic-pin",
+        mqtt_registration_uuid="synthetic-registration",
+        device_id="synthetic-device",
+        access_token="Bearer synthetic-access",
+        control_token="Bearer synthetic-expiring-grant",
+        control_token_expiry=1790000001.0,
+    )
+    vehicle = Vehicle(id="synthetic", ccu_ccs2_protocol_support=1)
+    with pytest.raises(APIError, match="refresh failed"):
+        api.force_refresh_vehicle_state(token, vehicle)
+    grant, refresh = api._request.call_args_list
+    assert grant.args == ("PUT", "/api/v1/user/pin")
+    assert refresh.args == ("GET", "/api/v2/spa/vehicles/synthetic/ccs2/carstatus")
+    assert refresh.kwargs["headers"]["Authorization"] == "Bearer synthetic-fresh-grant"
+    helper.close.assert_called_once()
