@@ -589,3 +589,165 @@ def test_diagnostics_track_early_results_once_and_timeout(session):
     assert instance.status("private-pending", timeout=0.001) == ORDER_STATUS.TIMEOUT
     instance.close()
     assert instance.diagnostics["last_status"] == "timeout"
+
+
+def test_late_callbacks_cannot_resurrect_closed_session(session):
+    instance, client = session
+    instance.prepare()
+    instance.close()
+    instance._on_connect(client, None, {}, 0, None)
+    instance._on_subscribe(client, None, 7, [1, 1, 1], None)
+    instance._on_connect_fail(client, None)
+    assert instance.closed
+    assert instance.diagnostics["ready"] is False
+    assert instance.diagnostics["last_status"] == "not_started"
+    client.subscribe.assert_called_once()
+
+
+def test_close_during_bootstrap_prevents_client_start(session):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+
+    instance, client = session
+    entered, release = Event(), Event()
+    first = next(instance._http_session.request.side_effect)
+
+    def request(*args, **kwargs):
+        entered.set()
+        assert release.wait(2), "bootstrap release was not signaled"
+        return first
+
+    instance._http_session.request.side_effect = request
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(instance.prepare)
+        try:
+            assert entered.wait(2), "bootstrap never started"
+            instance.close()
+        finally:
+            release.set()
+        with pytest.raises(APIError, match="closed"):
+            future.result(timeout=2)
+    assert instance._http_session.request.call_count == 1
+    client.connect_async.assert_not_called()
+    assert instance._client is None
+    assert instance.diagnostics["ready"] is False
+
+
+def test_close_interrupts_subscription_wait_without_waiting_for_timeout(session):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+
+    instance, client = session
+    started = Event()
+
+    def start():
+        instance._on_connect(client, None, {}, 0, None)
+        started.set()
+        return 0
+
+    client.loop_start = start
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(instance.prepare)
+        assert started.wait(2), "network loop did not start"
+        instance.close()
+        with pytest.raises(APIError, match="closed"):
+            future.result(timeout=2)
+    client.disconnect.assert_called_once()
+    client.loop_stop.assert_called_once()
+    assert instance.diagnostics["ready"] is False
+
+
+def test_concurrent_prepare_bootstraps_only_once(session, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event, Lock
+
+    instance, client = session
+    entered, release, second_entered = Event(), Event(), Event()
+    real_lock = Lock()
+
+    class ObservedLock:
+        entries = 0
+        entries_lock = Lock()
+
+        def __enter__(self):
+            with self.entries_lock:
+                self.entries += 1
+                if self.entries == 2:
+                    second_entered.set()
+            real_lock.acquire()
+
+        def __exit__(self, *args):
+            real_lock.release()
+
+    instance._prepare_lock = ObservedLock()
+    replies = list(instance._http_session.request.side_effect)
+    paths = {
+        "/api/v3/servicehub/device/host": replies[0],
+        "/api/v3/servicehub/device/register": replies[1],
+        "/api/v3/servicehub/vehicles/metadatalist": replies[2],
+        "/api/v3/servicehub/device/protocol": replies[3],
+    }
+
+    def request(method, url, **kwargs):
+        if url.endswith("/device/host"):
+            entered.set()
+            assert release.wait(2), "bootstrap release was not signaled"
+        return paths[url.removeprefix(instance.SERVICEHUB_URL)]
+
+    instance._http_session.request.side_effect = request
+    factory = Mock(return_value=client)
+    monkeypatch.setattr("hyundai_kia_connect_api.japan_mqtt.mqtt.Client", factory)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(instance.prepare)
+        try:
+            assert entered.wait(2), "bootstrap never started"
+            second = executor.submit(instance.prepare)
+            assert second_entered.wait(2), "second prepare never reached bootstrap lock"
+        finally:
+            release.set()
+        first.result(timeout=2)
+        second.result(timeout=2)
+    factory.assert_called_once()
+    assert instance._http_session.request.call_count == 4
+
+
+def test_disconnected_session_cannot_start_a_replacement_client(session):
+    instance, client = session
+    instance.prepare()
+    instance._on_disconnect(client, None, {}, 1, None)
+    with pytest.raises(APIError, match="connection was lost"):
+        instance.prepare()
+    assert instance.closed
+    assert instance._http_session.request.call_count == 4
+    client.disconnect.assert_called_once()
+
+
+@pytest.mark.parametrize("timeout", [True, False, float("nan"), float("inf"), -1, 121])
+def test_invalid_wait_timeout_is_rejected_before_wait(session, timeout):
+    instance, _client = session
+    instance.prepare()
+    instance.track("synthetic-action")
+    with pytest.raises(APIError, match="wait timeout is invalid"):
+        instance.status("synthetic-action", timeout=timeout)
+
+
+def test_excessively_nested_json_cannot_stop_completion_processing(session):
+    instance, client = session
+    instance.prepare()
+    instance.track("synthetic-action")
+    instance._on_message(
+        client,
+        None,
+        SimpleNamespace(
+            topic=instance._topics[1],
+            payload=b"[" * 2000 + b"0" + b"]" * 2000,
+            retain=False,
+        ),
+    )
+    instance._on_message(
+        client,
+        None,
+        message(instance._topics[1], {"sid": "synthetic-action", "res-msg": "S"}),
+    )
+    assert instance.status("synthetic-action") == ORDER_STATUS.SUCCESS
+    assert instance.diagnostics["malformed_messages"] == 1
