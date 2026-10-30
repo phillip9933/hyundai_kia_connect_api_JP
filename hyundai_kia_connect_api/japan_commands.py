@@ -248,6 +248,46 @@ class JapanCommandsMixin:
             else:
                 return ORDER_STATUS.PENDING
             self._japan_actions[action_id] = (vehicle_id, helper, status)
+            if status in (ORDER_STATUS.TIMEOUT, ORDER_STATUS.FAILED):
+                # A terminal aggregate result will not poll its children again.
+                # Retire unresolved children so they cannot retain a shared
+                # broker session forever; unrelated pending actions still own it.
+                unresolved_status = (
+                    ORDER_STATUS.TIMEOUT
+                    if status == ORDER_STATUS.TIMEOUT
+                    else ORDER_STATUS.UNKNOWN
+                )
+                retired_helpers = {}
+                for child, child_status in zip(helper, statuses, strict=True):
+                    if child_status not in (ORDER_STATUS.PENDING, ORDER_STATUS.UNKNOWN):
+                        continue
+                    entry = self._japan_actions.get(child)
+                    if (
+                        entry is None
+                        or entry[0] != vehicle_id
+                        or entry[2] is not None
+                        or entry[1] is None
+                        or isinstance(entry[1], tuple)
+                    ):
+                        continue
+                    self._japan_actions[child] = (
+                        vehicle_id,
+                        entry[1],
+                        unresolved_status,
+                    )
+                    retired_helpers[id(entry[1])] = entry[1]
+                    if child == getattr(self, "_japan_diagnostic_action_id", None):
+                        self._japan_command_diagnostics["stage"] = (
+                            "timeout"
+                            if status == ORDER_STATUS.TIMEOUT
+                            else "unconfirmed"
+                        )
+                for session in retired_helpers.values():
+                    if not any(
+                        entry[1] is session and entry[2] is None
+                        for entry in self._japan_actions.values()
+                    ):
+                        session.close()
             return status
         try:
             status = helper.status(

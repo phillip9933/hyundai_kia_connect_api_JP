@@ -832,3 +832,66 @@ def test_flat_schedule_validates_both_envelopes_before_either_write(missing):
         )
     api._japan_command.assert_not_called()
     assert [call.args[0] for call in api._request.call_args_list] == ["PUT", "GET"]
+
+
+@pytest.mark.parametrize("unrelated_pending", [False, True])
+def test_composite_budget_exhaustion_retires_unpolled_children(
+    monkeypatch, unrelated_pending
+):
+    api, token, vehicle = setup()
+    clock = [0.0]
+    monkeypatch.setattr(
+        "hyundai_kia_connect_api.japan_commands.time.monotonic", lambda: clock[0]
+    )
+    api._remember_japan_action("first", vehicle.id, api.helper)
+    api._remember_japan_action("second", vehicle.id, api.helper)
+    api._remember_japan_action("aggregate", vehicle.id, ("first", "second"))
+    if unrelated_pending:
+        api._remember_japan_action("unrelated", vehicle.id, api.helper)
+
+    def status(action_id, timeout):
+        if action_id == "first":
+            clock[0] += timeout
+            return ORDER_STATUS.TIMEOUT
+        assert action_id == "second"
+        assert timeout == 0
+        return ORDER_STATUS.PENDING
+
+    api.helper.status.side_effect = status
+    assert (
+        api.check_action_status(token, vehicle, "aggregate", True, 60)
+        == ORDER_STATUS.TIMEOUT
+    )
+    assert api._japan_actions["second"][2] == ORDER_STATUS.TIMEOUT
+    assert api.check_action_status(token, vehicle, "second") == ORDER_STATUS.TIMEOUT
+    assert api.helper.status.call_count == 2
+    assert api.check_action_status(token, vehicle, "aggregate") == ORDER_STATUS.TIMEOUT
+    if unrelated_pending:
+        api.helper.close.assert_not_called()
+        assert api._japan_actions["unrelated"][2] is None
+    else:
+        api.helper.close.assert_called_once()
+
+
+@pytest.mark.parametrize("unrelated_pending", [False, True])
+def test_failed_composite_retires_unconfirmed_children_without_claiming_failure(
+    unrelated_pending,
+):
+    api, token, vehicle = setup()
+    api._remember_japan_action("first", vehicle.id, api.helper)
+    api._remember_japan_action("second", vehicle.id, api.helper)
+    api._remember_japan_action("aggregate", vehicle.id, ("first", "second"))
+    api._japan_diagnostic_action_id = "second"
+    api._japan_command_diagnostics = {"stage": "waiting"}
+    if unrelated_pending:
+        api._remember_japan_action("unrelated", vehicle.id, api.helper)
+    api.helper.status.side_effect = [ORDER_STATUS.FAILED, ORDER_STATUS.PENDING]
+    assert api.check_action_status(token, vehicle, "aggregate") == ORDER_STATUS.FAILED
+    assert api.check_action_status(token, vehicle, "second") == ORDER_STATUS.UNKNOWN
+    assert api._japan_command_diagnostics["stage"] == "unconfirmed"
+    assert api.helper.status.call_count == 2
+    if unrelated_pending:
+        api.helper.close.assert_not_called()
+        assert api._japan_actions["unrelated"][2] is None
+    else:
+        api.helper.close.assert_called_once()
