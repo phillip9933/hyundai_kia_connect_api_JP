@@ -258,3 +258,34 @@ def test_workflow_diagnostics_preserve_safe_failure(adapter, failure, category):
     assert summary["elapsed_seconds"] >= 0
     assert "PRIVATE" not in repr(summary)
     assert adapter.svm_diagnostics == summary
+
+
+@pytest.mark.parametrize("value", [None, [], "PRIVATE_RESPONSE", 42])
+def test_non_object_camera_payload_is_sanitized(value):
+    with pytest.raises(
+        InvalidAPIResponseError, match="response is incomplete"
+    ) as error:
+        parse_japan_svm(value, ZoneInfo("Asia/Tokyo"))
+    assert "PRIVATE" not in str(error.value)
+
+
+def test_non_finite_image_dimension_is_sanitized():
+    response = payload()
+    response["scsDetail"]["imageSize"] = [float("inf"), 720]
+    with pytest.raises(InvalidAPIResponseError, match="dimensions are invalid"):
+        parse_japan_svm(response, ZoneInfo("Asia/Tokyo"))
+
+
+def test_line_wrapped_base64_is_accepted_but_unknown_characters_are_rejected():
+    response = payload()
+    encoded = response["scsDetail"]["svmImage"]
+    response["scsDetail"]["svmImage"] = " \t\r\n".join(
+        encoded[index : index + 4] for index in range(0, len(encoded), 4)
+    )
+    assert (
+        parse_japan_svm(response, ZoneInfo("Asia/Tokyo")).image_bytes
+        == b"SYNTHETIC_IMAGE"
+    )
+    response["scsDetail"]["svmImage"] += "\u200b"
+    with pytest.raises(InvalidAPIResponseError, match="image is invalid"):
+        parse_japan_svm(response, ZoneInfo("Asia/Tokyo"))

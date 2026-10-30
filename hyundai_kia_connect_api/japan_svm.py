@@ -36,6 +36,8 @@ from .utils import get_child_value, parse_datetime
 
 def parse_japan_svm(payload: dict, timezone: dt.tzinfo) -> SVMDetails:
     """Parse a Japan resMsg.scsDetail without logging image or location data."""
+    if not isinstance(payload, dict):
+        raise InvalidAPIResponseError("Japan camera response is incomplete")
     detail = payload.get("scsDetail")
     if not isinstance(detail, dict):
         raise InvalidAPIResponseError("Japan camera response is incomplete")
@@ -43,7 +45,9 @@ def parse_japan_svm(payload: dict, timezone: dt.tzinfo) -> SVMDetails:
     if not isinstance(encoded, str) or not encoded:
         raise InvalidAPIResponseError("Japan camera image is missing")
     try:
-        image = base64.b64decode(encoded, validate=True)
+        # MIME-style line wrapping is valid image transport; retain strict
+        # alphabet validation after removing only ASCII whitespace.
+        image = base64.b64decode(re.sub(r"[ \t\r\n]", "", encoded), validate=True)
     except (ValueError, binascii.Error):
         raise InvalidAPIResponseError("Japan camera image is invalid") from None
     if not image:
@@ -55,7 +59,12 @@ def parse_japan_svm(payload: dict, timezone: dt.tzinfo) -> SVMDetails:
             captured_at = parse_datetime(raw_time, timezone)
         except (ValueError, TypeError, AttributeError):
             raise InvalidAPIResponseError("Japan camera timestamp is invalid") from None
-    size, sizes = _parse_image_sizes(detail.get("imageSize"))
+    try:
+        size, sizes = _parse_image_sizes(detail.get("imageSize"))
+    except (OverflowError, ValueError, TypeError):
+        raise InvalidAPIResponseError(
+            "Japan camera image dimensions are invalid"
+        ) from None
     return SVMDetails(
         image_bytes=image,
         captured_at=captured_at,
